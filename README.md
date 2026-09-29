@@ -56,12 +56,15 @@ avwap_trader/
 │   ├── instruments.py    # instrument masters → F&O stock universe, lot sizes
 │   ├── option_chain.py   # option chain + expiry list (paced: 1 req / 3 s)
 │   ├── market_data.py    # intraday 15-min candles + batched quotes
+│   ├── liquidity.py      # adapt captured Dhan/project data for liquidity scoring
 │   ├── orders.py         # place order / order status / positions
 │   └── feed.py           # DhanCandlePollFeed (real data) + MockFeed (dev only)
 ├── market/
 │   ├── candles.py        # 15-min candle engine (boundary/dedupe/no-intracandle)
-│   └── universe.py       # expiry legs (monthly / N weeklies), per-leg ATM±N ITM (default 4), scanner ∪ positions
-── strategy/
+│   ├── universe.py       # expiry legs (monthly / N weeklies), per-leg ATM±N ITM, scanner ∪ positions
+│   ├── contract_discovery.py # point-in-time NSE options, ATM/ITM CE/PE, identity + birth date
+│   └── liquidity.py      # timestamp-safe option-contract and chain liquidity scoring
+├── strategy/
 │   ├── avwap.py          # per-contract AVWAP state (persisted, never reset daily)
 │   ├── rules.py          # the ONLY strategy rules (cross / close-above)
 │   └── engine.py         # signal engine + duplicate-signal protection
@@ -77,8 +80,105 @@ avwap_trader/
 │   ├── database.py       # SQLite: candles, avwap_state, signals, positions, orders, journal, kv
 │   └── journal.py        # permanent audit log
 ├── dashboard/            # Flask dashboard (status, scanner, positions, controls)
-└── tests/                # 65 tests covering the §48 testing requirements
+└── tests/                # 133 tests covering strategy + Phases 2 and 3
 ```
+
+## Phase 2 — option contract discovery
+
+`market/contract_discovery.py` is an isolated discovery layer. It consumes the
+Phase 1 validated stock universe, a timestamped contract-master catalog, and an
+as-of underlying price (or a `(symbol, timestamp) -> price` provider). It
+reuses `market.universe.select_monthly_expiry` and `find_atm`; it does not
+score liquidity/volatility, create AVWAP signals, or place orders.
+
+```python
+from market.contract_discovery import OptionContractCatalog, OptionContractDiscovery
+
+# `stock_universe` is the initialized Phase 1 market.universe_manager.UniverseManager.
+catalog = OptionContractCatalog.from_universe_manager(stock_universe)
+engine = OptionContractDiscovery.from_universe_manager(
+    stock_universe,
+    catalog=catalog,
+    price_provider=lambda symbol, at: historical_or_live_spot(symbol, at),
+)
+result = engine.discover_option_contracts(
+    "RELIANCE", "2026-09-15 10:00", max_itm=6
+)
+print(result.to_dict())
+```
+
+For replay/backtests, save dated masters outside Git and load the catalog with
+`OptionContractCatalog.load(path)`. The engine uses only the latest snapshot
+captured at or before the query time; it raises
+`HistoricalContractSnapshotUnavailable` instead of falling forward to a
+present-day master. Pass a price provider that returns the underlying's price
+at that same timestamp. CE ITM strikes are below ATM and PE ITM strikes are
+above ATM. Explicit strike-interval metadata is used when available; otherwise
+the engine follows the actual ordered strike grid and records each local gap,
+so nonuniform grids do not assume a ₹50/₹100 step. Missing contracts are
+reported, never synthesized.
+
+The Dhan master parser preserves contract-specific birth-date metadata when a
+source supplies it. It leaves `contract_birth_date=None` if unavailable—it
+never substitutes the underlying listing date. Supply `birth_date_provider`
+when a contract-specific source is available; the included
+`contract_birth_date_from_candles()` helper derives the date from that option's
+first supplied candle. The standard master may not carry the field, so exact
+historical availability still requires archived point-in-time masters and
+option-specific listing/history data.
+
+## Phase 3 — option-contract liquidity engine
+
+`market/liquidity.py` scores each Phase 2 `OptionContract` independently using
+`ContractLiquidityData` (timestamped observations plus option candles). The
+`dhan/liquidity.py` adapter combines captured `OptionChainData`, optional
+`DhanMarketData` quotes, and project candle/history inputs. For example:
+
+```python
+from dhan.liquidity import DhanLiquidityAdapter
+from market.liquidity import OptionLiquidityEngine
+
+inputs = DhanLiquidityAdapter(market_data).capture_current(
+    phase2_contracts, captured_chain, candles_by_security_id=completed_candles
+)
+report = OptionLiquidityEngine(config).score_option_chain(inputs, as_of=timestamp)
+for result in report.contracts:
+    print(result.option_type, result.score, result.qualified, result.rejection_reasons)
+```
+
+The default factor weights are volume 30%, OI 25%, spread 20%, depth 15%, and
+trading consistency 10% (weights are configurable and normalized). Volume, OI,
+and displayed depth are mid-rank percentiles among supplied contracts for the
+same underlying, expiry, and option side; a single candidate or tie maps to 50.
+Depth is the smaller of aggregate bid-side and ask-side displayed quantities
+(top-level sizes are used when full depth is absent). Volume uses the latest
+captured cumulative value, falling back to the configured window of completed
+bar volume. Spread quality is measured as `(ask - bid) / midpoint × 100`, with
+configurable preferred/max spread values. Consistency is the share of available
+valid completed bars with nonzero volume (invalid OHLC marks data invalid).
+The reported `premium` is the current bid—the executable sell-side price—while
+`last_price` is retained separately. Missing factor evidence scores zero
+rather than increasing the other weights.
+
+The configurable starter settings in `config/config.example.json` use a 0.30%
+preferred and 0.50% maximum spread, 60-second quote freshness, and nullable
+qualification floors. Those are not empirically validated trading thresholds;
+calibrate and set appropriate score, volume/OI, premium, and depth minimums
+before relying on `qualified`. Every rejected contract includes reason codes
+such as `INVALID_DATA`, `WIDE_SPREAD`, `LOW_VOLUME`, `LOW_OI`, `LOW_PREMIUM`,
+`LOW_DEPTH`, or `LOW_LIQUIDITY_SCORE`. The chain summary reports separate CE
+and PE averages and subtracts a configurable penalty (up to 25 points by
+default) for one-sided chains; that aggregate never changes the individual CE
+or PE result.
+
+Scoring is point-in-time: observations after `as_of` are discarded, naive
+input times are interpreted as IST, and a candle is used only when its full
+configured interval ended by `as_of`. Live Dhan chain/quote calls are timestamped
+when received. Dhan does not provide historical quote/depth replay through this
+adapter; historical BBO, depth, and OI snapshots must have been captured and
+archived with their original timestamps. Candle history alone cannot recreate
+historical bid/ask or depth. Phase 3 is a standalone evaluation engine: it does
+not calculate AVWAP, generate signals, place orders, or change strategy logic.
 
 ## 3. Installation & running
 
@@ -253,7 +353,7 @@ candles independently; the dashboard never influences trading.
 ## 10. Testing
 
 ```
-python -m pytest tests/ -v     # 65 tests
+python -m pytest tests/ -v     # 133 tests
 ```
 
 Coverage per the specification's testing requirements:
@@ -270,6 +370,14 @@ Coverage per the specification's testing requirements:
   out-of-order rejection, tick-building volume deltas
 * Universe: expiry switch rule (1st/23rd/24th, passed expiry), ATM ties,
   ATM movement never drops open positions
+* Contract discovery: point-in-time master selection (no future snapshots),
+  monthly expiry/close-of-expiry handling, ATM and CE/PE ITM directions,
+  dynamic strike-step inference, missing contracts, birth dates, and token
+  identity
+* Liquidity engine: comparable-contract percentiles and configurable weights,
+  spread/invalid quote checks, multiple rejection reasons, independent CE/PE
+  scoring, one-sided chain penalty, Dhan field adaptation, and as-of filtering
+  of future observations and incomplete candles
 * Multi-expiry legs: N consecutive weekly selection (current+next week,
   rolling forward), per-leg ATM from each leg's own strikes, `drop_expiries`
   removes rolled-off legs while keeping positions monitored, one dashboard

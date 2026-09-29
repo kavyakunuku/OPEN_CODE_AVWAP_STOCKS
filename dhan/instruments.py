@@ -88,6 +88,40 @@ def _norm_expiry(value: str) -> Optional[str]:
         return None
 
 
+def _norm_contract_date(value) -> Optional[str]:
+    """Normalize optional option-contract listing/birth metadata.
+
+    The standard Dhan detailed scrip master currently has no documented
+    contract birth/listing date.  Accept such fields if another source or an
+    archived master supplies them; never substitute an underlying date.
+    """
+    v = str(value or "").strip()
+    if not v:
+        return None
+    if v.isdigit() and len(v) == 8:  # YYYYMMDD is common in CSV exports
+        try:
+            return datetime.strptime(v, "%Y%m%d").date().isoformat()
+        except ValueError:
+            return None
+    return _norm_expiry(v)
+
+
+def _row_value(row: dict, *names: str) -> str:
+    """Case/whitespace-insensitive optional CSV field lookup."""
+    for name in names:
+        value = row.get(name.strip().upper())
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    # Nonstandard exports may use lower-case or padded headers; only build this
+    # fallback map if the normal Dhan uppercase lookup did not find a value.
+    values = {str(k or "").strip().upper(): v for k, v in row.items()}
+    for name in names:
+        value = values.get(name.strip().upper())
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
 def parse_scrip_master_detailed(text: str, default_lot_size: int = 250) -> MasterBundle:
     reader = csv.DictReader(io.StringIO(text))
     names = {(f or "").strip().upper() for f in (reader.fieldnames or [])}
@@ -107,50 +141,64 @@ def parse_scrip_master_detailed(text: str, default_lot_size: int = 250) -> Maste
     n_rows = 0
     for row in reader:
         try:
-            if (row.get("EXCH_ID") or "").strip() != "NSE":
+            exchange = _row_value(row, "EXCH_ID").upper()
+            if exchange != "NSE":
                 continue
             # every NSE option has INSTRUMENT_TYPE='OP';
             # the candle-API instrument code lives in the INSTRUMENT column:
             # 'OPTSTK' = stock options
-            if (row.get("INSTRUMENT_TYPE") or "").strip() != "OP":
+            if _row_value(row, "INSTRUMENT_TYPE").upper() != "OP":
                 continue
             n_rows += 1
-            opt = (row.get("OPTION_TYPE") or "").strip().upper()
+            opt = _row_value(row, "OPTION_TYPE").upper()
             if opt not in ("CE", "PE"):
                 continue
             instrument = (
                 "OPTIDX"
-                if (row.get("INSTRUMENT") or "").strip().upper() == "OPTIDX"
+                if _row_value(row, "INSTRUMENT").upper() == "OPTIDX"
                 else "OPTSTK"
             )
             try:
-                strike = float((row.get("STRIKE_PRICE") or "0").strip())
+                strike = float(_row_value(row, "STRIKE_PRICE") or "0")
             except ValueError:
                 continue
             if strike <= 0:
                 continue
-            expiry = _norm_expiry(row.get("SM_EXPIRY_DATE") or "")
+            expiry = _norm_expiry(_row_value(row, "SM_EXPIRY_DATE"))
             if not expiry:
                 continue
-            sid = (row.get("SECURITY_ID") or "").strip()
-            underlying = (row.get("UNDERLYING_SYMBOL") or "").strip().upper()
+            sid = _row_value(row, "SECURITY_ID")
+            underlying = _row_value(row, "UNDERLYING_SYMBOL").upper()
             if not sid or not underlying:
                 continue
-            lot = 0
             try:
-                lot = int(float((row.get("LOT_SIZE") or "0").strip() or 0))
+                lot = int(float(_row_value(row, "LOT_SIZE") or "0"))
             except ValueError:
                 lot = 0
             if lot <= 0:
                 lot = int(default_lot_size)
-            uid = (row.get("UNDERLYING_SECURITY_ID") or "").strip()
+            uid = _row_value(row, "UNDERLYING_SECURITY_ID")
             if uid:
                 bundle.underlying_ids[underlying] = uid
 
-            symbol = (row.get("DISPLAY_NAME") or "").strip()
+            symbol = _row_value(row, "DISPLAY_NAME") or _row_value(row, "SYMBOL_NAME")
             if not symbol:
-                symbol = (row.get("SYMBOL_NAME") or "").strip() or \
-                    f"{underlying} {strike:g} {opt}"
+                symbol = f"{underlying} {strike:g} {opt}"
+            tick = _parse_tick_size(_row_value(row, "TICK_SIZE"))
+            birth_date = _norm_contract_date(_row_value(
+                row,
+                "CONTRACT_BIRTH_DATE", "CONTRACT_LISTING_DATE", "LISTING_DATE",
+                "LISTED_DATE", "TRADABLE_DATE", "FIRST_TRADE_DATE",
+                "CONTRACT_START_DATE",
+            ))
+            try:
+                strike_interval = float(_row_value(
+                    row, "STRIKE_INTERVAL", "STRIKE_STEP", "STRIKE_PRICE_INTERVAL"
+                ) or "") or None
+            except ValueError:
+                strike_interval = None
+            expiry_flag = _row_value(row, "EXPIRY_FLAG").upper() or None
+
             key = (sid, opt, strike, expiry)
             if key in seen:
                 continue
@@ -165,9 +213,14 @@ def parse_scrip_master_detailed(text: str, default_lot_size: int = 250) -> Maste
                     expiry=expiry,
                     lot_size=lot,
                     instrument=instrument,
+                    exchange=exchange,
+                    exchange_segment="NSE_FNO",
+                    tick_size=tick,
+                    contract_birth_date=birth_date,
+                    expiry_flag=expiry_flag,
+                    strike_interval=strike_interval,
                 )
             )
-            tick = _parse_tick_size(row.get("TICK_SIZE") or "")
             bundle.tick_sizes[sid] = tick
         except Exception:
             continue
@@ -186,7 +239,7 @@ def parse_scrip_master_detailed(text: str, default_lot_size: int = 250) -> Maste
 # Legacy "option-instrument-master" format (fallback)
 # ---------------------------------------------------------------------------
 _ALIASES = {
-    "security_id": ["securityid", "security_id", "id"],
+    "security_id": ["securityid", "security_id", "id", "instrument_token"],
     "symbol": ["symbol", "displayname", "symbolname"],
     "strike": ["strike", "strikeprice"],
     "expiry": ["expiry", "expirydate", "optionexpirydate", "expiry_date",
@@ -194,6 +247,14 @@ _ALIASES = {
     "option_type": ["type", "optiontype", "option_type", "optionkind"],
     "underlying": ["underlying", "underlyingsymbol", "base", "underlying_symbol"],
     "lot_size": ["lotsize", "lot_size"],
+    "tick_size": ["ticksize", "tick_size"],
+    "exchange": ["exchange", "exch_id", "exch"],
+    "exchange_segment": ["exchange_segment"],
+    "contract_birth_date": ["contract_birth_date", "contract_listing_date",
+                            "listing_date", "listed_date", "tradable_date",
+                            "first_trade_date", "contract_start_date"],
+    "expiry_flag": ["expiry_flag"],
+    "strike_interval": ["strike_interval", "strike_step", "strike_price_interval"],
 }
 
 
@@ -248,6 +309,20 @@ def parse_legacy_option_master(text: str, default_lot_size: int = 250) -> Master
             if key in seen:
                 continue
             seen.add(key)
+            tick_size = None
+            if d.get("tick_size"):
+                tick_size = _parse_tick_size(d["tick_size"])
+            try:
+                strike_interval = float(d.get("strike_interval") or "") or None
+            except ValueError:
+                strike_interval = None
+            exchange = (d.get("exchange") or "NSE").upper()
+            if exchange in ("NFO", "NSE_FNO"):
+                exchange = "NSE"
+            exchange_segment = (d.get("exchange_segment") or "NSE_FNO").upper()
+            if exchange_segment in ("D", "NFO"):
+                exchange_segment = "NSE_FNO"
+            birth_date = _norm_contract_date(d.get("contract_birth_date"))
             bundle.contracts.append(
                 OptionContract(
                     security_id=d["security_id"],
@@ -257,8 +332,16 @@ def parse_legacy_option_master(text: str, default_lot_size: int = 250) -> Master
                     option_type=opt_type,
                     expiry=expiry,
                     lot_size=lot,
+                    exchange=exchange,
+                    exchange_segment=exchange_segment,
+                    tick_size=tick_size,
+                    contract_birth_date=birth_date,
+                    expiry_flag=(d.get("expiry_flag") or "").upper() or None,
+                    strike_interval=strike_interval,
                 )
             )
+            if tick_size is not None:
+                bundle.tick_sizes[d["security_id"]] = tick_size
         except Exception:
             continue
     if not bundle.contracts:

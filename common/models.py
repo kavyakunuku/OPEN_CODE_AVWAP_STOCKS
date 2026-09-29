@@ -15,8 +15,15 @@ STATUS_REJECTED = "REJECTED"
 
 @dataclass(frozen=True)
 class OptionContract:
-    """A single listed option contract (one CE or one PE, one strike, one expiry)."""
-    security_id: str          # Dhan security id (str form)
+    """A single listed option contract (one CE or one PE, one strike, one expiry).
+
+    ``security_id`` is Dhan's instrument token.  ``contract_birth_date`` is
+    deliberately contract-specific; it must never be populated from the
+    underlying's listing date.  Some masters do not provide that field, so it
+    remains ``None`` until an authoritative source (for example, the first
+    tradable candle for this option) is available.
+    """
+    security_id: str          # Dhan security id / instrument token (str form)
     symbol: str               # e.g. "RELIANCE 1500 CE"
     underlying: str           # e.g. "RELIANCE"
     strike: float
@@ -24,6 +31,17 @@ class OptionContract:
     expiry: str               # "YYYY-MM-DD"
     lot_size: int
     instrument: str = "OPTSTK"  # Dhan candle-API instrument: OPTSTK (stock options)
+    exchange: str = "NSE"       # exchange name from the contract master
+    exchange_segment: str = "NSE_FNO"  # Dhan API segment for NSE F&O contracts
+    tick_size: Optional[float] = None
+    contract_birth_date: Optional[str] = None  # ISO date, if the source supplies it
+    expiry_flag: Optional[str] = None           # master metadata, e.g. M / W
+    strike_interval: Optional[float] = None     # optional explicit master metadata
+
+    @property
+    def instrument_token(self) -> str:
+        """Alias used by APIs that call Dhan's ``security_id`` a token."""
+        return self.security_id
 
     @property
     def name(self) -> str:

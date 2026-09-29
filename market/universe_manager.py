@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional
 
 from common.config import load_config
+from common.utils import now_ist
 from dhan.instruments import load_master_bundle, fo_stock_universe
 from dhan.client import DhanREST
 
@@ -74,6 +75,7 @@ class UniverseManager:
         self.rest = rest
         self._universe_cfg = self._load_universe_config()
         self._master_contracts: list = []
+        self._master_loaded_at: Optional[datetime] = None
         self._valid_symbols: list[str] = []
         self._invalid_symbols: list[str] = []
         self._missing_contracts: list[str] = []
@@ -119,6 +121,7 @@ class UniverseManager:
         log.info("Loading instrument master for universe validation...")
         bundle = load_master_bundle(self.rest, cache_dir, ttl, default_lot)
         self._master_contracts = bundle.contracts
+        self._master_loaded_at = now_ist()
 
         # Get all valid F&O stock underlyings from the master
         master_underlyings = set(fo_stock_universe(self._master_contracts))
@@ -222,6 +225,27 @@ class UniverseManager:
         log.info("=====================================")
 
     # ------------------------------------------------------------------ public API
+    @property
+    def master_loaded_at(self) -> Optional[datetime]:
+        """IST timestamp when the current instrument-master snapshot was loaded."""
+        return self._master_loaded_at
+
+    def get_validated_contracts(self) -> list:
+        """Return master contracts only for the validated Phase 1 universe."""
+        if not self._initialized:
+            raise RuntimeError("UniverseManager is not initialized")
+        allowed = set(self._valid_symbols)
+        return [c for c in self._master_contracts if c.underlying.upper() in allowed]
+
+    def get_contracts_for_symbol(self, symbol: str) -> list:
+        """Return actual master rows for one enabled Phase 1 symbol, or []."""
+        if not self._initialized:
+            raise RuntimeError("UniverseManager is not initialized")
+        symbol = (symbol or "").strip().upper()
+        if symbol not in set(self._valid_symbols):
+            return []
+        return [c for c in self._master_contracts if c.underlying.upper() == symbol]
+
     def get_all_symbols(self) -> list[str]:
         """Return all configured symbols (valid + invalid)."""
         return self._universe_cfg.get("symbols", [])

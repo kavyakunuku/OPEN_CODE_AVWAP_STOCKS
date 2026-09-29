@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import Optional
 
 from common.models import Candle, Quote
-from common.utils import candle_start_for, epoch, from_epoch, parse_epoch
+from common.utils import candle_start_for, epoch, from_epoch, now_ist, parse_epoch
 
 log = logging.getLogger("avwap.dhan.market_data")
 
@@ -170,7 +170,6 @@ class DhanMarketData:
         # Default to the max (one request for the whole universe) to stay well
         # under the rate limit; any overflow is paced to >=1.1 s apart.
         batch_size = min(self.quote_batch_size, 1000)
-        now_ts = int(datetime.now().timestamp())
         first = True
         for i in range(0, len(ids), batch_size):
             if not first:
@@ -182,6 +181,9 @@ class DhanMarketData:
             except Exception as e:
                 log.warning("quotes batch failed (%d ids): %s", len(batch), e)
                 continue
+            # Stamp after the response arrives; do not make an observation
+            # appear available before it was actually received.
+            now_ts = epoch(now_ist())
             for sec, v in data.items():
                 price = v.get("last_price") or v.get("lastPrice")
                 if price is None:

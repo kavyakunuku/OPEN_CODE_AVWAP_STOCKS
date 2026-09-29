@@ -264,6 +264,17 @@ class TestUniverseManagerAPI:
         assert result is True  # No error
         # Should not crash
 
+    def test_validated_contract_accessors_and_master_timestamp(self, initialized_manager):
+        """Discovery can consume only contracts belonging to Phase 1-valid symbols."""
+        all_contracts = initialized_manager.get_validated_contracts()
+        reliance = initialized_manager.get_contracts_for_symbol("reliance")
+        assert all_contracts
+        assert len(reliance) == 10
+        assert all(c.underlying == "RELIANCE" for c in reliance)
+        assert len(all_contracts) == 20 * 10
+        assert initialized_manager.get_contracts_for_symbol("NOTFOUND") == []
+        assert initialized_manager.master_loaded_at is not None
+
     def test_uninitialized_warning(self, mock_rest):
         """Test that methods warn when called before initialize."""
         cfg = {"storage": {"instrument_cache_dir": "data/instruments"},
