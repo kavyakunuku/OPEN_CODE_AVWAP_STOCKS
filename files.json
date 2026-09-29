@@ -1,0 +1,522 @@
+[
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\config",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dashboard",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\data",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\logs",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\market",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\storage",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\.gitignore",
+        "Length":  93
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\app.py",
+        "Length":  80790
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\main.py",
+        "Length":  5964
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\PROJECT_OVERVIEW.md",
+        "Length":  24384
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\README.md",
+        "Length":  20515
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\requirements.txt",
+        "Length":  465
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\config.py",
+        "Length":  3803
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\models.py",
+        "Length":  3515
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\utils.py",
+        "Length":  4803
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\version.py",
+        "Length":  241
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\__init__.py",
+        "Length":  0
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\__pycache__\\config.cpython-314.pyc",
+        "Length":  5549
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\__pycache__\\models.cpython-314.pyc",
+        "Length":  6827
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\__pycache__\\utils.cpython-314.pyc",
+        "Length":  9750
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\__pycache__\\version.cpython-314.pyc",
+        "Length":  400
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\common\\__pycache__\\__init__.cpython-314.pyc",
+        "Length":  141
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\config\\config.example.json",
+        "Length":  2540
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\config\\config.json",
+        "Length":  3137
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\config\\config.json.bak",
+        "Length":  3541
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dashboard\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dashboard\\app.py",
+        "Length":  71359
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dashboard\\__init__.py",
+        "Length":  0
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dashboard\\__pycache__\\app.cpython-314.pyc",
+        "Length":  75175
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dashboard\\__pycache__\\__init__.cpython-314.pyc",
+        "Length":  144
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\data\\exports",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\data\\instruments",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\data\\trader.db",
+        "Length":  1667072
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\data\\trader.db-shm",
+        "Length":  32768
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\data\\trader.db-wal",
+        "Length":  32
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\data\\exports\\daily_pnl.csv",
+        "Length":  153
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\data\\instruments\\api-scrip-master-detailed.csv",
+        "Length":  35607426
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\client.py",
+        "Length":  9001
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\feed.py",
+        "Length":  17621
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\instruments.py",
+        "Length":  12852
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\market_data.py",
+        "Length":  9254
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\option_chain.py",
+        "Length":  5152
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\orders.py",
+        "Length":  4569
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__init__.py",
+        "Length":  0
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__pycache__\\client.cpython-314.pyc",
+        "Length":  12313
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__pycache__\\feed.cpython-314.pyc",
+        "Length":  27423
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__pycache__\\instruments.cpython-314.pyc",
+        "Length":  18661
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__pycache__\\market_data.cpython-314.pyc",
+        "Length":  12213
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__pycache__\\option_chain.cpython-314.pyc",
+        "Length":  10616
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__pycache__\\orders.cpython-314.pyc",
+        "Length":  7229
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\dhan\\__pycache__\\__init__.cpython-314.pyc",
+        "Length":  139
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\broker.py",
+        "Length":  1630
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\live.py",
+        "Length":  16536
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\paper.py",
+        "Length":  6459
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\__init__.py",
+        "Length":  0
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\__pycache__\\broker.cpython-314.pyc",
+        "Length":  3228
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\__pycache__\\live.cpython-314.pyc",
+        "Length":  20350
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\__pycache__\\paper.cpython-314.pyc",
+        "Length":  7554
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\execution\\__pycache__\\__init__.cpython-314.pyc",
+        "Length":  144
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\logs\\trader.log",
+        "Length":  8138802
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\market\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\market\\candles.py",
+        "Length":  6508
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\market\\universe.py",
+        "Length":  11148
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\market\\__init__.py",
+        "Length":  0
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\market\\__pycache__\\candles.cpython-314.pyc",
+        "Length":  8815
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\market\\__pycache__\\universe.cpython-314.pyc",
+        "Length":  19744
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\market\\__pycache__\\__init__.cpython-314.pyc",
+        "Length":  141
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\pnl.py",
+        "Length":  845
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\positions.py",
+        "Length":  4513
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\risk.py",
+        "Length":  3518
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\__init__.py",
+        "Length":  0
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\__pycache__\\pnl.cpython-314.pyc",
+        "Length":  1413
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\__pycache__\\positions.cpython-314.pyc",
+        "Length":  7101
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\__pycache__\\risk.cpython-314.pyc",
+        "Length":  6691
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\portfolio\\__pycache__\\__init__.cpython-314.pyc",
+        "Length":  144
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\storage\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\storage\\database.py",
+        "Length":  17306
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\storage\\journal.py",
+        "Length":  1495
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\storage\\__init__.py",
+        "Length":  0
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\storage\\__pycache__\\database.cpython-314.pyc",
+        "Length":  26956
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\storage\\__pycache__\\journal.cpython-314.pyc",
+        "Length":  2940
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\storage\\__pycache__\\__init__.cpython-314.pyc",
+        "Length":  142
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\avwap.py",
+        "Length":  5877
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\engine.py",
+        "Length":  6879
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\rules.py",
+        "Length":  1189
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\__init__.py",
+        "Length":  0
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\__pycache__\\avwap.cpython-314.pyc",
+        "Length":  9429
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\__pycache__\\engine.cpython-314.pyc",
+        "Length":  9494
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\__pycache__\\rules.cpython-314.pyc",
+        "Length":  1698
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\strategy\\__pycache__\\__init__.cpython-314.pyc",
+        "Length":  143
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\conftest.py",
+        "Length":  4044
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_avwap.py",
+        "Length":  4796
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_avwap_gap_backfill.py",
+        "Length":  9170
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_candles.py",
+        "Length":  3772
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_engine.py",
+        "Length":  8912
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_index_universe.py",
+        "Length":  1430
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_multi_expiry_universe.py",
+        "Length":  4199
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_paper.py",
+        "Length":  4503
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_recovery.py",
+        "Length":  4747
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_risk.py",
+        "Length":  2998
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_rules.py",
+        "Length":  1409
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_universe.py",
+        "Length":  4636
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_universe_filter.py",
+        "Length":  987
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tests\\test_v2_dashboard.py",
+        "Length":  12683
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\dashboard_render_check",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\__pycache__",
+        "Length":  null
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\check_avwap.py",
+        "Length":  5944
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\daily_pnl_history.py",
+        "Length":  4097
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\export_to_csv.py",
+        "Length":  4841
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\fix_position_times.py",
+        "Length":  5287
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\reanchor_avwap.py",
+        "Length":  4902
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\_common.py",
+        "Length":  2049
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\dashboard_render_check\\gen_payload.py",
+        "Length":  4963
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\dashboard_render_check\\README.md",
+        "Length":  633
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\dashboard_render_check\\render_check.js",
+        "Length":  8533
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\tools\\__pycache__\\_common.cpython-314.pyc",
+        "Length":  5985
+    },
+    {
+        "FullName":  "E:\\Random\\AVWAP_TESTING_INDEX\\__pycache__\\app.cpython-314.pyc",
+        "Length":  110352
+    }
+]

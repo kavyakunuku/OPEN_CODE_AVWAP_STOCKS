@@ -1,0 +1,28 @@
+{
+  "_comment": "NSE F&O Stock Universe Configuration. These are candidate stocks for the option-selling strategy. Each symbol is validated against the Dhan instrument master at startup.",
+  "universe": {
+    "enabled": true,
+    "symbols": [
+      "RELIANCE",
+      "ICICIBANK",
+      "HDFCBANK",
+      "SBIN",
+      "AXISBANK",
+      "VEDL",
+      "HINDZINC",
+      "INFY",
+      "ITC",
+      "BHARTIARTL",
+      "TATAMOTORS",
+      "BAJFINANCE",
+      "ADANIENT",
+      "ADANIPORTS",
+      "TATASTEEL",
+      "HINDALCO",
+      "SUNPHARMA",
+      "BEL",
+      "ETERNAL",
+      "LT"
+    ]
+  }
+}

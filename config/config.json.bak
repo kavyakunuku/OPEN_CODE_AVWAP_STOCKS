@@ -1,0 +1,102 @@
+{
+  "_comment": "AVWAP F&O option-selling system (stock options only). Copy to config.json and fill in your Dhan credentials. TRADING_MODE MUST be PAPER until the strategy is validated. LIVE requires explicit confirmation (see README).",
+  "trading_mode": "PAPER",
+  "dhan": {
+    "client_id": "1000570106",
+    "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJ1c2VyUmVnaW9uIjoiUjEiLCJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzkwMTM2MDYzLCJpYXQiOjE3OTAwNDk2NjMsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMDAwNTcwMTA2In0.n7W2uSHJOzXRuQqs7Vxt2FTIZhDU4ZC7kRWjg6myTI1HrhzQtL_b5xdPsoaE1RTxZ6_AG18KHoZXLkYEo-VGhw",
+    "rest_base_url": "https://api.dhan.co",
+    "http_timeout_seconds": 10,
+    "instrument_master_ttl_hours": 12
+  },
+  "market_data": {
+    "source": "dhan",
+    "mode": "candle_poll",
+    "loop_tick_seconds": 1.0,
+    "boundary_grace_seconds": 8,
+    "ltp_poll_seconds": 30,
+    "quote_batch_size": 1000,
+    "history_start": "month_start",
+    "history_lookback_days_fallback": 5,
+    "universe_refresh_minutes": 60,
+    "_universe_comment": "Optional curated list of liquid F&O stocks to trade (30 names).",
+    "universe_stocks": [
+      "RELIANCE",
+      "HDFCBANK",
+      "SBIN",
+      "ICICIBANK",
+      "INFY",
+      "TCS",
+      "BEL",
+      "HAL",
+      "BSE",
+      "DIXON",
+      "AXISBANK",
+      "BHARTIARTL",
+      "BAJFINANCE",
+      "ETERNAL",
+      "KOTAKBANK",
+      "VEDL",
+      "HINDZINC",
+      "ITC",
+      "TATASTEEL",
+      "TATAMOTORS",
+      "LT",
+      "M&M",
+      "ADANIENT",
+      "ADANIPORTS",
+      "MARUTI",
+      "HCLTECH",
+      "SUNPHARMA",
+      "TRENT",
+      "JIOFIN",
+      "COALINDIA"
+    ],
+    "mock": {
+      "underlyings": [
+        "MOCKA",
+        "MOCKB",
+        "MOCKC"
+      ],
+      "speed": 240
+    }
+  },
+  "strategy": {
+    "candle_interval_minutes": 15,
+    "_itm_comment": "Scanner width = ATM + N in-the-money strikes per side (CE below ATM, PE above ATM). Default 4: deeper ITM strikes have thin liquidity/OI on most names. Raise to 5-6 only if you specifically want more contracts. Open positions are always monitored even when they fall outside this width.",
+    "itm_strikes_per_side": 4,
+    "expiry_switch_day": 24
+  },
+  "paper": {
+    "fill_mode": "candle_close",
+    "slippage_bps": 0,
+    "next_quote_timeout_seconds": 45
+  },
+  "live": {
+    "product_type": "MARGIN",
+    "order_type": "MARKET",
+    "limit_price_offset_ticks": 1,
+    "order_poll_seconds": 3,
+    "confirm_phrase": "I_UNDERSTAND_LIVE_TRADING"
+  },
+  "risk": {
+    "quantity_per_trade": null,
+    "max_open_positions": 8,
+    "max_trades_per_day": 20,
+    "max_daily_loss": 25000,
+    "default_lot_size": 250
+  },
+  "storage": {
+    "db_path": "data/trader.db",
+    "instrument_cache_dir": "data/instruments"
+  },
+  "dashboard": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 9000,
+    "control_token": ""
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/trader.log"
+  }
+}

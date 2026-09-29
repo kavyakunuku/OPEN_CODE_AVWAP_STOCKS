@@ -1,0 +1,70 @@
+{
+  "_comment": "AVWAP F&O option-selling system (stock options only). Copy to config.json and fill in your Dhan credentials. TRADING_MODE MUST be PAPER until the strategy is validated. LIVE requires explicit confirmation (see README).",
+  "trading_mode": "PAPER",
+  "dhan": {
+    "client_id": "",
+    "access_token": "",
+    "rest_base_url": "https://api.dhan.co",
+    "http_timeout_seconds": 10,
+    "instrument_master_ttl_hours": 12
+  },
+  "market_data": {
+    "source": "dhan",
+    "mode": "candle_poll",
+    "loop_tick_seconds": 1.0,
+    "boundary_grace_seconds": 8,
+    "ltp_poll_seconds": 30,
+    "quote_batch_size": 1000,
+    "history_start": "month_start",
+    "history_lookback_days_fallback": 5,
+    "universe_refresh_minutes": 60,
+    "_universe_comment": "Optional: curated list of liquid F&O stocks to trade, e.g. [\"RELIANCE\", \"HDFCBANK\", \"INFY\", ...]. Empty [] = the full F&O universe from the Dhan master.",
+    "universe_stocks": [],
+    "mock": {
+      "underlyings": [
+        "MOCKA",
+        "MOCKB",
+        "MOCKC"
+      ],
+      "speed": 240
+    }
+  },
+  "strategy": {
+    "candle_interval_minutes": 15,
+    "itm_strikes_per_side": 6,
+    "expiry_switch_day": 24
+  },
+  "paper": {
+    "fill_mode": "candle_close",
+    "slippage_bps": 0,
+    "next_quote_timeout_seconds": 45
+  },
+  "live": {
+    "product_type": "MARGIN",
+    "order_type": "MARKET",
+    "limit_price_offset_ticks": 1,
+    "order_poll_seconds": 3,
+    "confirm_phrase": "I_UNDERSTAND_LIVE_TRADING"
+  },
+  "risk": {
+    "quantity_per_trade": null,
+    "max_open_positions": 8,
+    "max_trades_per_day": 20,
+    "max_daily_loss": 25000,
+    "default_lot_size": 250
+  },
+  "storage": {
+    "db_path": "data/trader.db",
+    "instrument_cache_dir": "data/instruments"
+  },
+  "dashboard": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 9000,
+    "control_token": ""
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/trader.log"
+  }
+}
