@@ -97,6 +97,28 @@ DEFAULTS: dict = {
             "trading_days_per_year": 252,
         },
     },
+    "opportunity": {
+        "weights": {
+            "liquidity": 0.40,
+            "volatility": 0.30,
+            "chain_quality": 0.20,
+            "execution_quality": 0.10,
+        },
+        "selection": {
+            "max_stocks": 10,
+            "max_contracts_per_stock": 14,
+            "max_top_opportunities": 10,
+        },
+        "execution": {
+            "preferred_spread_percent": 0.30,
+            "max_spread_percent": 0.50,
+            "max_quote_age_seconds": 60,
+            "weights": {
+                "spread": 0.70,
+                "freshness": 0.30,
+            },
+        },
+    },
     "paper": {
         "fill_mode": "candle_close",
         "slippage_bps": 0,

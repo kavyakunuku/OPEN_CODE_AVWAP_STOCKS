@@ -65,7 +65,8 @@ avwap_trader/
 │   ├── universe.py       # expiry legs (monthly / N weeklies), per-leg ATM±N ITM, scanner ∪ positions
 │   ├── contract_discovery.py # point-in-time NSE options, ATM/ITM CE/PE, identity + birth date
 │   ├── liquidity.py      # timestamp-safe option-contract and chain liquidity scoring
-│   └── volatility.py    # point-in-time stock/option ATR and realized-volatility metrics
+│   ├── volatility.py     # point-in-time stock/option ATR and realized-volatility metrics
+│   └── opportunity.py    # deterministic ranking over Phase 2–4 results (scanner only)
 ├── strategy/
 │   ├── avwap.py          # per-contract AVWAP state (persisted, never reset daily)
 │   ├── rules.py          # the ONLY strategy rules (cross / close-above)
@@ -82,7 +83,7 @@ avwap_trader/
 │   ├── database.py       # SQLite: candles, avwap_state, signals, positions, orders, journal, kv
 │   └── journal.py        # permanent audit log
 ├── dashboard/            # Flask dashboard (status, scanner, positions, controls)
-└── tests/                # 151 tests covering strategy + Phases 2–4
+└── tests/                # 163 tests covering strategy + Phases 2–5
 ```
 
 ## Phase 2 — option contract discovery
@@ -235,6 +236,60 @@ bars and timestamped quote/IV observations; a current Dhan chain snapshot is not
 historical data. Phase 4 does not modify AVWAP, entry/exit rules, order or position
 management, or generate signals.
 
+## Phase 5 — opportunity ranking scanner
+
+`market/opportunity.py` combines Phase 2 discovery results, a Phase 3
+`OptionChainLiquidityReport`, and one Phase 4 `VolatilityAnalysisResult` per
+underlying. It is standalone and deterministic: it consumes these results,
+never fetches market data, never places orders, and never changes an open
+position.
+
+```python
+from market.opportunity import OpportunityRankingEngine, OpportunityScannerInput
+
+scan_input = OpportunityScannerInput(
+    as_of=timestamp,
+    discoveries=phase2_discoveries,
+    liquidity_report=phase3_report,
+    volatility_by_underlying={"VEDL": vedl_phase4_result},
+    existing_position_underlyings=open_position_underlyings,
+)
+ranked = OpportunityRankingEngine(config).rank(scan_input)
+print(ranked.to_json())
+print(ranked.to_csv("stocks"))
+print(ranked.to_csv("contracts"))
+```
+
+Only contracts explicitly **qualified by Phase 3** can enter a new-opportunity
+ranking; high volatility cannot rescue a liquidity rejection. The default
+opportunity weights are 40% liquidity, 30% underlying volatility, 20% Phase 3
+chain quality, and 10% execution quality. All four are configurable, but
+configuration rejects a volatility weight equal to or greater than liquidity.
+Execution quality uses only the Phase 3 quote spread and quote age (default 70/30 internal
+spread/freshness weights); it does not estimate fills or slippage. Missing chain
+or execution evidence contributes zero without redistributing the other weights
+and is listed in `missing_components`. Missing Phase 3 or Phase 4 results are
+excluded rather than invented.
+
+Both CE and PE contracts qualify independently. An existing position blocks
+new opportunities for its underlying, even if a different strike/side scores
+higher; pass active underlyings (or a candidate security ID, which is resolved
+to its underlying) through the position-exclusion inputs. This prevents
+scanner ranks from becoming position-switch instructions. Phase 2 timestamp
+and Phase 3/4 evaluation timestamps must exactly match the requested `as_of`;
+its archived contract-master snapshot may be older but never later.
+
+Default selection is the top 10 stocks, at most 14 qualified contracts per
+stock, and 10 top opportunities. These limits and weights are configurable in
+`opportunity.*`. Contract ranks are global among the returned stock selection.
+Stock component scores are arithmetic means over that stock's selected
+qualified contracts; stock volatility uses its Phase 4 underlying score. Stable
+tie-breaks use symbol, expiry, side, strike, and security ID. `to_dict()` returns
+`timestamp`, `stocks`, `contracts`, and `top_opportunities` (plus exclusions and
+configuration); `to_json()`, `to_csv(section)`, `write_json()`, and `write_csv()`
+provide structured file/export paths. Phase 5 does not connect to order
+placement, AVWAP, entry/exit rules, or position management.
+
 ## 3. Installation & running
 
 ```bash
@@ -291,6 +346,9 @@ load config + database
 | `market_data.universe_stocks` | `[]` (all F&O stocks) | optional curated list of liquid stocks to trade (e.g. 67 high-volume names, shipped in `config/config.json`). Symbols are matched against the live Dhan master case-insensitively; names not in the master are logged and skipped. `[]` = full universe |
 | `strategy.itm_strikes_per_side` | `4` | ATM + N in-the-money strikes per side (CE below ATM, PE above ATM). Default 4 — deeper ITM strikes have thin liquidity/OI on most names. Open positions are always monitored even when they fall outside this width |
 | `strategy.expiry_switch_day` | `24` | premium-preservation switch day |
+| `opportunity.weights` | `0.40 / 0.30 / 0.20 / 0.10` | liquidity / volatility / chain quality / execution quality scanner weights |
+| `opportunity.selection` | `10 / 14 / 10` | max stocks / contracts per stock / top opportunities |
+| `opportunity.execution` | spread `0.30–0.50%`, quote age `60s` | execution-quality spread and freshness normalization (not fill/slippage prediction) |
 | `paper.fill_mode` | `candle_close` | `candle_close` (fill = signal candle close) or `next_quote` (first LTP after the close, fallback candle close) |
 | `paper.slippage_bps` | `0` | optional slippage applied against the trader |
 | `live.product_type` | `MARGIN` | Dhan product type for orders |
@@ -408,7 +466,7 @@ candles independently; the dashboard never influences trading.
 ## 10. Testing
 
 ```
-python -m pytest tests/ -v     # 151 tests
+python -m pytest tests/ -v     # 163 tests
 ```
 
 Coverage per the specification's testing requirements:
@@ -438,6 +496,10 @@ Coverage per the specification's testing requirements:
   IV, data-insufficiency reporting, complete-session daily aggregation, target
   saturation/weight behavior, liquidity-qualified option gating, and no-look-ahead
   boundaries
+* Opportunity scanner: 40/30/20/10 weighted scoring, Phase 3 liquidity hard gate,
+  execution spread/freshness scoring, deterministic ranks/tie-breaks, top-N caps,
+  independent CE/PE qualification, existing-position underlying exclusion,
+  historical as-of integrity, end-to-end Phase 2/3/4 inputs, and JSON/CSV output
 * Multi-expiry legs: N consecutive weekly selection (current+next week,
   rolling forward), per-leg ATM from each leg's own strikes, `drop_expiries`
   removes rolled-off legs while keeping positions monitored, one dashboard

@@ -1,6 +1,6 @@
 # AVWAP F&O Option-Selling System (Stock Options Only) — Project Overview
 
-**Status:** Phase 4 volatility analysis implemented · Python 3.10+ · ~14.3k lines of Python (≈11.1k application/ops, ≈3.3k tests) plus ~49 KB of hand-rolled dashboard JavaScript · 151 automated tests, all passing · trading app remains in **PAPER** mode (real Dhan market data, no live orders)
+**Status:** Phase 5 opportunity ranking scanner implemented · Python 3.10+ · ~15.7k lines of Python (≈12.0k application/ops, ≈3.7k tests) plus ~49 KB of hand-rolled dashboard JavaScript · 163 automated tests, all passing · trading app remains in **PAPER** mode (real Dhan market data, no live orders)
 
 ---
 
@@ -89,6 +89,24 @@ qualified. Volatility remains descriptive and cannot override the independent
 Phase 3 liquidity gate; this engine adds no signals or trade approvals. IV is
 reported only from timestamped source data and is never inferred.
 
+### Phase 5 — opportunity ranking scanner (standalone)
+
+`market/opportunity.py` joins Phase 2 discovered contracts, Phase 3 qualified
+liquidity/chain results, and Phase 4 underlying volatility at one exact `as_of`
+timestamp. Phase 3 qualification is a hard eligibility gate. Its configurable
+starter weights are 40% liquidity, 30% volatility, 20% chain quality, and 10%
+execution quality. All weights are configurable, but validation preserves
+liquidity as primary by requiring its weight to exceed volatility. Execution
+quality uses only observed spread and quote freshness, not a fabricated fill
+estimate.
+
+The scanner supports configurable stock/contract/top-opportunity caps, ranks CE
+and PE independently, and excludes all new contracts for an underlying with an
+open position. Contract and stock ranking use stable tie-breaks; historical
+master snapshots can be older than `as_of` but never newer, while Phase 3/4
+results must match it exactly. JSON and CSV serializers are included. It is an
+informational scanner only: no AVWAP, position changes, signals, or orders.
+
 ---
 
 ## 4. Architecture
@@ -133,6 +151,7 @@ reported only from timestamped source data and is never inferred.
 | `market/contract_discovery.py` | 758 | Phase 2 point-in-time contract catalog and NSE option discovery: reuses the monthly expiry selector, chooses ATM from the point-in-time strike grid, uses explicit strike-step metadata or actual local grid gaps, preserves instrument identity/birth date, and refuses future snapshots in historical mode. No scoring/signals/orders. |
 | `market/liquidity.py` | 679 | Phase 3 per-option score and CE/PE-independent option-chain summary: comparable-contract percentiles, configurable weighted factors/floors, rejection codes, quote freshness, and as-of filtering of observations/completed bars. No AVWAP/signals/orders. |
 | `market/volatility.py` | 755 | Phase 4 point-in-time daily/15-minute ATR, realized and intraday volatility, option movement/ATR/realized volatility, timestamped IV, and a capped configurable movement score. No strategy or trade approval. |
+| `market/opportunity.py` | 874 | Phase 5 deterministic 40/30/20/10 new-opportunity ranking across liquidity, volatility, chain quality and execution quality; hard Phase 3 gate, top-N limits, existing-position exclusion, and JSON/CSV output. Scanner only. |
 | `market/candles.py` | 172 | 15-min candle windowing (session-aware IST windows, boundary grace). |
 | `dhan/client.py` | 141 | REST client: auth headers (`access-token`, `client-id`), JSON, retries with backoff on 429/5xx, typed `DhanAPIError`. |
 | `dhan/market_data.py` | 220 | Quote API (batches ≤1000 ids, NSE_FNO / NSE_EQ) and intraday 15-min candles (5-yr depth) with pacing + retries; received quote timestamps use IST. |
@@ -152,12 +171,12 @@ reported only from timestamped source data and is never inferred.
 | `storage/journal.py` | 49 | Append-only audit journal (every signal, order, fill, reconcile, manual control action, structured startup timeline). |
 | `common/models.py` | 146 | Dataclasses: `Candle`, contract-identity-rich `OptionContract`, `Quote`, `Signal`, action constants. |
 | `common/utils.py` | 144 | IST time handling (ZoneInfo with fixed UTC+05:30 fallback for Windows), session state (PRE_OPEN/OPEN/CLOSED), candle-window math, logging setup. |
-| `common/config.py` | 184 | Config loader + dotted-path access; includes configurable liquidity and volatility weights, targets, thresholds and lookback windows. |
+| `common/config.py` | 206 | Config loader + dotted-path access; includes configurable liquidity, volatility and opportunity weights, targets, thresholds, lookback windows and selection limits. |
 | `dashboard/app.py` | 1281 | Flask dashboard (port 9000) + ~49 KB embedded vanilla JS. **12 pages** across two zones: *Live Trading* (Overview/Command Center, Scanner, Contract detail with canvas candlestick+AVWAP chart, Position Command Center, Signal Center with full explainability chain, Orders with raw Dhan responses) and *Data + Operations* (Data Health, System Health, Alert Center, Journal with filters + CSV/JSON export, Restart/Recovery, read-only Settings). REST: `/api/state`, `/api/contract/<sec>`, `/api/journal`, `/api/control` (gated by `dashboard.control_token`; actions: pause/resume, emergency stop/release, exit-all, **close-position**, **schedule-avwap-rebuild**). No CDN, no framework, no WebSocket. |
 | `tools/check_avwap.py` | — | **Read-only AVWAP auditor**: lists anchor dates + PARTIAL flags; deep-dive per symbol (fresh full-history VWAP vs stored, 5-day-fallback simulation, diagnosis). |
 | `tools/reanchor_avwap.py` | — | AVWAP repair: delete + full rebuild for late-anchored contracts (`--all`, symbol filter, `--dry`). |
 | `tools/export_to_csv.py` / `fix_position_times.py` | — | Data export / maintenance utilities. |
-| `tests/` | 3,278 | **151 tests**: existing strategy/AVWAP and recovery suites, Phase 2 contract discovery, Phase 3 liquidity scoring and history-integrity tests, plus Phase 4 ATR, realized/intraday volatility, option metrics/IV, insufficiency, as-of boundaries, and no-look-ahead coverage. |
+| `tests/` | 3,743 | **163 tests**: existing strategy/AVWAP and recovery suites, Phase 2 contract discovery, Phase 3 liquidity scoring and history-integrity tests, Phase 4 volatility metrics and point-in-time boundaries, plus Phase 5 score weights/ranking/top-N, hard liquidity gating, side independence, position exclusion, historical inputs, deterministic output, and CSV/JSON serialization. |
 
 ---
 
@@ -241,7 +260,7 @@ python main.py --mode LIVE --i-understand-live   # live (after the checklist!)
 
 ## 10. Testing & current status
 
-- **151 automated tests**, all green: the existing AVWAP/candle/strategy, universe, risk, paper execution, recovery, and dashboard suites; Phase 2 point-in-time option discovery; Phase 3 Dhan liquidity adaptation, percentile/weight scoring, rejection codes, CE/PE independence and chain imbalance; and Phase 4 ATR/ATR%, rolling and intraday volatility, option movement/ATR/IV, insufficiency, completed-bar boundaries, and no-look-ahead checks.
+- **163 automated tests**, all green: existing AVWAP/candle/strategy, universe, risk, paper execution, recovery, and dashboard suites; Phase 2 point-in-time option discovery; Phase 3 liquidity scoring and historical data integrity; Phase 4 ATR/realized/intraday volatility and timestamp safety; and Phase 5 scoring/weights, ranking/top-N, liquidity hard gate, CE/PE independence, position exclusion, historical integrity, determinism, and JSON/CSV output.
 - **Dashboard render-verified:** the served page is loaded in a headless DOM (jsdom) against payloads generated from a real mock `TraderApp`; all 12 pages render with zero JavaScript errors, and the scanner/quick-view/contract/close-button interactions are exercised.
 - **Validated live:** full-universe validation against real Dhan data; AVWAP anchoring verified against chart-anchored VWAPs (root cause of one divergence — silent 429-storm fallback to a late anchor — fixed with pacing, retries, and the permanent PARTIAL flag + repair tools).
 - **Known open item:** LTP column occasionally shows "–" in the scanner — diagnostic logging for the quote poll was added in v2026-09-16l to pinpoint the cause.
@@ -272,3 +291,4 @@ python main.py --mode LIVE --i-understand-live   # live (after the checklist!)
 ---
 
 *One line to remember: the system does exactly one thing — sell options when a completed 15-min candle crosses below that contract's cumulative AVWAP and buy them back when it closes above it — and spends the rest of its engineering effort making sure that one thing is computed correctly, survives restarts, and can never trade live without an explicit, deliberate decision.*
+xplicit, deliberate decision.*

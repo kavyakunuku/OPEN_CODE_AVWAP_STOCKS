@@ -47,6 +47,17 @@ from .contract_discovery import (
     get_expiry,
     get_put_contracts,
 )
+from .opportunity import (
+    ExcludedOpportunity,
+    OpportunityConfigError,
+    OpportunityInputError,
+    OpportunityRankingEngine,
+    OpportunityRankingResult,
+    OpportunityScannerInput,
+    OptionOpportunityScanner,
+    RankedContractOpportunity,
+    RankedStockOpportunity,
+)
 
 __all__ = [
     "UniverseManager",
@@ -89,4 +100,13 @@ __all__ = [
     "get_call_contracts",
     "get_expiry",
     "get_put_contracts",
+    "ExcludedOpportunity",
+    "OpportunityConfigError",
+    "OpportunityInputError",
+    "OpportunityRankingEngine",
+    "OpportunityRankingResult",
+    "OpportunityScannerInput",
+    "OptionOpportunityScanner",
+    "RankedContractOpportunity",
+    "RankedStockOpportunity",
 ]
