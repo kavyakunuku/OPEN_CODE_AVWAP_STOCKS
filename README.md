@@ -57,13 +57,15 @@ avwap_trader/
 │   ├── option_chain.py   # option chain + expiry list (paced: 1 req / 3 s)
 │   ├── market_data.py    # intraday 15-min candles + batched quotes
 │   ├── liquidity.py      # adapt captured Dhan/project data for liquidity scoring
+│   ├── volatility.py     # adapt captured Dhan/project price/IV data
 │   ├── orders.py         # place order / order status / positions
 │   └── feed.py           # DhanCandlePollFeed (real data) + MockFeed (dev only)
 ├── market/
 │   ├── candles.py        # 15-min candle engine (boundary/dedupe/no-intracandle)
 │   ├── universe.py       # expiry legs (monthly / N weeklies), per-leg ATM±N ITM, scanner ∪ positions
 │   ├── contract_discovery.py # point-in-time NSE options, ATM/ITM CE/PE, identity + birth date
-│   └── liquidity.py      # timestamp-safe option-contract and chain liquidity scoring
+│   ├── liquidity.py      # timestamp-safe option-contract and chain liquidity scoring
+│   └── volatility.py    # point-in-time stock/option ATR and realized-volatility metrics
 ├── strategy/
 │   ├── avwap.py          # per-contract AVWAP state (persisted, never reset daily)
 │   ├── rules.py          # the ONLY strategy rules (cross / close-above)
@@ -80,7 +82,7 @@ avwap_trader/
 │   ├── database.py       # SQLite: candles, avwap_state, signals, positions, orders, journal, kv
 │   └── journal.py        # permanent audit log
 ├── dashboard/            # Flask dashboard (status, scanner, positions, controls)
-└── tests/                # 133 tests covering strategy + Phases 2 and 3
+└── tests/                # 151 tests covering strategy + Phases 2–4
 ```
 
 ## Phase 2 — option contract discovery
@@ -179,6 +181,59 @@ adapter; historical BBO, depth, and OI snapshots must have been captured and
 archived with their original timestamps. Candle history alone cannot recreate
 historical bid/ask or depth. Phase 3 is a standalone evaluation engine: it does
 not calculate AVWAP, generate signals, place orders, or change strategy logic.
+
+## Phase 4 — volatility analysis engine
+
+`market/volatility.py` calculates daily ATR/ATR%, 15-minute ATR/ATR%, annualized
+daily realized volatility, same-session intraday volatility, and (when supplied)
+option price movement, option ATR, and option realized volatility. `dhan/volatility.py`
+converts existing timestamped Dhan/project candles, quotes, and option-chain
+spot/LTP/IV into engine inputs; it makes no network requests.
+
+```python
+from dhan.volatility import DhanVolatilityAdapter
+from market.volatility import VolatilityAnalysisEngine
+
+inputs = DhanVolatilityAdapter().build_input(
+    "RELIANCE",
+    daily_bars=stock_daily_bars,
+    bars_15m=stock_15m_bars,
+    option_contracts=phase2_contracts,
+    option_bars_by_security_id=option_15m_bars,
+    option_chain=captured_chain,
+    liquidity_qualified_security_ids=phase3_qualified_ids,
+)
+result = VolatilityAnalysisEngine(config).analyze(inputs, as_of=timestamp)
+print(result.to_dict())
+```
+
+ATR uses Wilder smoothing (14-bar starter periods). Daily realized volatility is
+the annualized sample standard deviation of log returns; intraday volatility is
+annualized from consecutive 15-minute, same-session returns and excludes
+overnight gaps. Daily ATR can use supplied daily bars or fully observed 15-minute
+sessions; incomplete sessions are not aggregated. Insufficient windows return
+`None` and are listed in `insufficient_data`, rather than being fabricated.
+
+The volatility score uses configurable starter weights of 40% 15-minute ATR%,
+30% daily realized volatility, 20% intraday volatility, and 10% option movement.
+Each component saturates at its configurable normalization target, so extreme
+movement does not keep increasing the score. The targets in the example config
+are illustrative and must be calibrated. Unavailable components contribute
+zero; their weights are not redistributed, and missing windows are exposed in
+`insufficient_data`. Only option series explicitly marked liquidity-qualified
+by Phase 3 contribute to the option-movement factor; other
+option metrics may still be reported for analysis. This is a movement score,
+not a liquidity score or trade approval: Phase 3 liquidity qualification remains
+an independent prerequisite and cannot be overridden by volatility.
+
+All bars and price/IV observations are filtered at the requested timestamp.
+15-minute bars are used only when their full interval ended by `as_of`; a daily
+bar for the current session is unavailable until the 15:30 close. IV is copied
+only from a timestamped source observation, reported in the source's raw units,
+and never inferred. Historical analysis requires archived underlying/option
+bars and timestamped quote/IV observations; a current Dhan chain snapshot is not
+historical data. Phase 4 does not modify AVWAP, entry/exit rules, order or position
+management, or generate signals.
 
 ## 3. Installation & running
 
@@ -353,7 +408,7 @@ candles independently; the dashboard never influences trading.
 ## 10. Testing
 
 ```
-python -m pytest tests/ -v     # 133 tests
+python -m pytest tests/ -v     # 151 tests
 ```
 
 Coverage per the specification's testing requirements:
@@ -378,6 +433,11 @@ Coverage per the specification's testing requirements:
   spread/invalid quote checks, multiple rejection reasons, independent CE/PE
   scoring, one-sided chain penalty, Dhan field adaptation, and as-of filtering
   of future observations and incomplete candles
+* Volatility engine: Wilder ATR/ATR%, 15-minute ATR, rolling annualized and
+  intraday volatility, option movement/ATR/realized volatility and timestamped
+  IV, data-insufficiency reporting, complete-session daily aggregation, target
+  saturation/weight behavior, liquidity-qualified option gating, and no-look-ahead
+  boundaries
 * Multi-expiry legs: N consecutive weekly selection (current+next week,
   rolling forward), per-leg ATM from each leg's own strikes, `drop_expiries`
   removes rolled-off legs while keeping positions monitored, one dashboard

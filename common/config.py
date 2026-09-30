@@ -72,6 +72,31 @@ DEFAULTS: dict = {
         },
         "side_imbalance_penalty": 0.25,
     },
+    "volatility": {
+        "weights": {
+            "atr_15m_percent": 0.40,
+            "realized_volatility": 0.30,
+            "intraday_volatility": 0.20,
+            "option_movement": 0.10,
+        },
+        "normalization_targets": {
+            "atr_15m_percent": 0.25,
+            "realized_volatility": 30.0,
+            "intraday_volatility": 30.0,
+            "option_movement_percent": 10.0,
+        },
+        "windows": {
+            "atr_period": 14,
+            "atr_15m_period": 14,
+            "realized_volatility_periods": 20,
+            "intraday_volatility_periods": 50,
+            "option_atr_period": 14,
+            "option_realized_volatility_periods": 20,
+            "option_movement_bars": 4,
+            "bars_per_session": 25,
+            "trading_days_per_year": 252,
+        },
+    },
     "paper": {
         "fill_mode": "candle_close",
         "slippage_bps": 0,

@@ -1,6 +1,6 @@
 # AVWAP F&O Option-Selling System (Stock Options Only) — Project Overview
 
-**Status:** Phase 3 liquidity evaluator implemented · Python 3.10+ · ~12.9k lines of Python (≈10.1k application/ops, ≈2.8k tests) plus ~49 KB of hand-rolled dashboard JavaScript · 133 automated tests, all passing · trading app remains in **PAPER** mode (real Dhan market data, no live orders)
+**Status:** Phase 4 volatility analysis implemented · Python 3.10+ · ~14.3k lines of Python (≈11.1k application/ops, ≈3.3k tests) plus ~49 KB of hand-rolled dashboard JavaScript · 151 automated tests, all passing · trading app remains in **PAPER** mode (real Dhan market data, no live orders)
 
 ---
 
@@ -70,6 +70,25 @@ current_close > current_avwap   →  BUY TO CLOSE
   - Ops tools validate and repair late anchors: `tools/check_avwap.py` (read-only audit, compares stored vs freshly-fetched VWAP) and `tools/reanchor_avwap.py` (delete + full rebuild, `--all`/`--dry`).
 - **Restart-safe:** anchor, cumulative value, and last-processed candle are persisted; already-consumed candles are never counted twice.
 
+### Phase 4 — volatility analysis (standalone)
+
+`market/volatility.py` reports daily ATR/ATR%, 15-minute ATR/ATR%, annualized
+daily realized volatility, same-session 15-minute volatility, and per-option
+movement/ATR/realized volatility where sufficient history is supplied. It uses
+only completed bars at the requested timestamp; daily bars for the current
+session are held back until 15:30, and daily bars synthesized from intraday
+history require a full session. Missing history produces `None` and an explicit
+insufficiency label.
+
+The configurable score gives 40% to 15-minute ATR%, 30% to underlying realized
+volatility, 20% to intraday volatility, and 10% to option movement. Component
+scores saturate at configurable normalization targets. Unavailable components
+contribute zero without redistributing their weights. Option series contribute
+to the option-movement factor only when explicitly marked as Phase 3 liquidity
+qualified. Volatility remains descriptive and cannot override the independent
+Phase 3 liquidity gate; this engine adds no signals or trade approvals. IV is
+reported only from timestamped source data and is never inferred.
+
 ---
 
 ## 4. Architecture
@@ -113,11 +132,13 @@ current_close > current_avwap   →  BUY TO CLOSE
 | `market/universe.py` | 284 | Per-underlying, per-expiry-leg universe: ATM detection from real chain strikes, CE/PE ITM windows, scanner + position contract sets, ATM re-tracking. |
 | `market/contract_discovery.py` | 758 | Phase 2 point-in-time contract catalog and NSE option discovery: reuses the monthly expiry selector, chooses ATM from the point-in-time strike grid, uses explicit strike-step metadata or actual local grid gaps, preserves instrument identity/birth date, and refuses future snapshots in historical mode. No scoring/signals/orders. |
 | `market/liquidity.py` | 679 | Phase 3 per-option score and CE/PE-independent option-chain summary: comparable-contract percentiles, configurable weighted factors/floors, rejection codes, quote freshness, and as-of filtering of observations/completed bars. No AVWAP/signals/orders. |
+| `market/volatility.py` | 755 | Phase 4 point-in-time daily/15-minute ATR, realized and intraday volatility, option movement/ATR/realized volatility, timestamped IV, and a capped configurable movement score. No strategy or trade approval. |
 | `market/candles.py` | 172 | 15-min candle windowing (session-aware IST windows, boundary grace). |
 | `dhan/client.py` | 141 | REST client: auth headers (`access-token`, `client-id`), JSON, retries with backoff on 429/5xx, typed `DhanAPIError`. |
 | `dhan/market_data.py` | 220 | Quote API (batches ≤1000 ids, NSE_FNO / NSE_EQ) and intraday 15-min candles (5-yr depth) with pacing + retries; received quote timestamps use IST. |
 | `dhan/option_chain.py` | 238 | Option chain + expiry list clients with a **shared 3 s pacer**; preserves capture time, OI change, quote sizes, and any supplied depth. |
 | `dhan/liquidity.py` | 185 | Adapts Phase 2 contracts, captured chain snapshots, project candles/history, and optional timestamped Dhan quotes; does not backfill historical quote/depth data. |
+| `dhan/volatility.py` | 167 | Adapts existing timestamped project candles, quotes, Phase 2 option identity, Phase 3-qualified IDs, and captured chain spot/LTP/IV; makes no network request or historical-data claim. |
 | `dhan/feed.py` | 406 | `DhanCandlePollFeed` (production candle source: history fetch, closed-candle fetch, LTP poll) and `MockFeed` (deterministic synthetic market for `--demo` and tests). |
 | `dhan/instruments.py` | 409 | Dhan scrip-master download/cache (12 h TTL): contract lookup, lot/tick sizes, optional contract birth date/strike-step metadata, underlying IDs, F&O universe extraction. |
 | `dhan/orders.py` | 119 | Live order placement/status/positions (order polling, fill detection). |
@@ -131,12 +152,12 @@ current_close > current_avwap   →  BUY TO CLOSE
 | `storage/journal.py` | 49 | Append-only audit journal (every signal, order, fill, reconcile, manual control action, structured startup timeline). |
 | `common/models.py` | 146 | Dataclasses: `Candle`, contract-identity-rich `OptionContract`, `Quote`, `Signal`, action constants. |
 | `common/utils.py` | 144 | IST time handling (ZoneInfo with fixed UTC+05:30 fallback for Windows), session state (PRE_OPEN/OPEN/CLOSED), candle-window math, logging setup. |
-| `common/config.py` | 159 | Config loader + dotted-path access; includes configurable liquidity weights, spread/freshness rules, thresholds and lookback windows. |
+| `common/config.py` | 184 | Config loader + dotted-path access; includes configurable liquidity and volatility weights, targets, thresholds and lookback windows. |
 | `dashboard/app.py` | 1281 | Flask dashboard (port 9000) + ~49 KB embedded vanilla JS. **12 pages** across two zones: *Live Trading* (Overview/Command Center, Scanner, Contract detail with canvas candlestick+AVWAP chart, Position Command Center, Signal Center with full explainability chain, Orders with raw Dhan responses) and *Data + Operations* (Data Health, System Health, Alert Center, Journal with filters + CSV/JSON export, Restart/Recovery, read-only Settings). REST: `/api/state`, `/api/contract/<sec>`, `/api/journal`, `/api/control` (gated by `dashboard.control_token`; actions: pause/resume, emergency stop/release, exit-all, **close-position**, **schedule-avwap-rebuild**). No CDN, no framework, no WebSocket. |
 | `tools/check_avwap.py` | — | **Read-only AVWAP auditor**: lists anchor dates + PARTIAL flags; deep-dive per symbol (fresh full-history VWAP vs stored, 5-day-fallback simulation, diagnosis). |
 | `tools/reanchor_avwap.py` | — | AVWAP repair: delete + full rebuild for late-anchored contracts (`--all`, symbol filter, `--dry`). |
 | `tools/export_to_csv.py` / `fix_position_times.py` | — | Data export / maintenance utilities. |
-| `tests/` | 2,803 | **133 tests**: AVWAP math, candle windowing, signal logic + dedup, universe/ATM and multi-expiry, risk, paper fills, restart recovery, dashboard/data-health behavior, Phase 2 contract discovery, and Phase 3 liquidity percentiles/weights, quote/depth validation, multi-reason qualification, CE/PE independence, and historical timestamp integrity. |
+| `tests/` | 3,278 | **151 tests**: existing strategy/AVWAP and recovery suites, Phase 2 contract discovery, Phase 3 liquidity scoring and history-integrity tests, plus Phase 4 ATR, realized/intraday volatility, option metrics/IV, insufficiency, as-of boundaries, and no-look-ahead coverage. |
 
 ---
 
@@ -220,7 +241,7 @@ python main.py --mode LIVE --i-understand-live   # live (after the checklist!)
 
 ## 10. Testing & current status
 
-- **133 automated tests**, all green: the existing AVWAP/candle/strategy, universe, risk, paper execution, recovery, and dashboard suites; Phase 2 point-in-time option discovery; and Phase 3 Dhan adaptation, percentile/weight scoring, spread and invalid-quote rejection, multiple reason codes, side-independent CE/PE evaluation, chain imbalance penalties, and no-future/incomplete-candle guarantees.
+- **151 automated tests**, all green: the existing AVWAP/candle/strategy, universe, risk, paper execution, recovery, and dashboard suites; Phase 2 point-in-time option discovery; Phase 3 Dhan liquidity adaptation, percentile/weight scoring, rejection codes, CE/PE independence and chain imbalance; and Phase 4 ATR/ATR%, rolling and intraday volatility, option movement/ATR/IV, insufficiency, completed-bar boundaries, and no-look-ahead checks.
 - **Dashboard render-verified:** the served page is loaded in a headless DOM (jsdom) against payloads generated from a real mock `TraderApp`; all 12 pages render with zero JavaScript errors, and the scanner/quick-view/contract/close-button interactions are exercised.
 - **Validated live:** full-universe validation against real Dhan data; AVWAP anchoring verified against chart-anchored VWAPs (root cause of one divergence — silent 429-storm fallback to a late anchor — fixed with pacing, retries, and the permanent PARTIAL flag + repair tools).
 - **Known open item:** LTP column occasionally shows "–" in the scanner — diagnostic logging for the quote poll was added in v2026-09-16l to pinpoint the cause.
@@ -240,6 +261,9 @@ python main.py --mode LIVE --i-understand-live   # live (after the checklist!)
 | `liquidity.weights` | volume / OI / spread / depth / consistency factor weights | 0.30 / 0.25 / 0.20 / 0.15 / 0.10 |
 | `liquidity.max_spread_percent` / `preferred_spread_percent` | hard spread rejection / full-score spread | 0.50% / 0.30% |
 | `liquidity.minimums.*` | optional qualification floors (score, volume/OI, percentiles, premium, depth) | null; calibrate before use |
+| `volatility.weights` | 15-minute ATR%, daily realized vol, intraday vol, qualified option movement | 0.40 / 0.30 / 0.20 / 0.10 |
+| `volatility.normalization_targets` | movement levels mapping component values to 100 points | illustrative; calibrate |
+| `volatility.windows` | ATR/RV lookbacks, session annualization and option movement window | 14 / 20 / 50 / 4 bars |
 | `risk.*` | quantity, max positions, max trades/day, max daily loss | set |
 | `paper.slippage_bps` | paper-fill slippage | 10 |
 | `dashboard.port` / `dashboard.control_token` | UI port / control gate | 9000 / — |
