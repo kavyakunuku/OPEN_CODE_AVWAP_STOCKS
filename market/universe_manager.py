@@ -120,8 +120,19 @@ class UniverseManager:
 
         log.info("Loading instrument master for universe validation...")
         bundle = load_master_bundle(self.rest, cache_dir, ttl, default_lot)
-        self._master_contracts = bundle.contracts
-        self._master_loaded_at = now_ist()
+        return self.initialize_from_master_bundle(bundle, captured_at=now_ist())
+
+    def initialize_from_master_bundle(
+        self, bundle, *, captured_at: Optional[datetime] = None
+    ) -> UniverseValidationReport:
+        """Validate the configured 20-stock universe against an already-loaded master.
+
+        TraderApp already loads the Dhan master for contract discovery. This
+        entry point reuses that exact snapshot rather than making a duplicate
+        download or validating against a different master file.
+        """
+        self._master_contracts = list(getattr(bundle, "contracts", ()) or ())
+        self._master_loaded_at = captured_at or now_ist()
 
         # Get all valid F&O stock underlyings from the master
         master_underlyings = set(fo_stock_universe(self._master_contracts))

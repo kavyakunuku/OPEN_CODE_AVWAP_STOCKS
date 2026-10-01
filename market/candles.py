@@ -19,6 +19,7 @@ Rules enforced here (spec §8, §9):
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime
 from typing import Optional
 
@@ -43,32 +44,70 @@ class CandleEngine:
         self._last_closed_ts: dict[str, int] = {}  # sec_id -> last delivered closed ts
 
     # ------------------------------------------------------- closed candles
+    @staticmethod
+    def _valid_ohlcv(candle: Candle) -> bool:
+        values = (candle.open, candle.high, candle.low, candle.close)
+        try:
+            prices = tuple(float(value) for value in values)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not all(math.isfinite(value) and value > 0 for value in prices):
+            return False
+        open_price, high, low, close = prices
+        if high < max(open_price, low, close) or low > min(open_price, high, close):
+            return False
+        volume = candle.volume
+        if isinstance(volume, bool):
+            return False
+        try:
+            volume_number = float(volume)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(volume_number) and volume_number >= 0 and volume_number.is_integer()
+
+    @staticmethod
+    def _nonnegative_count(value) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or number < 0 or not number.is_integer():
+            return None
+        return int(number)
+
     def ingest_closed(self, candle: Candle) -> Optional[Candle]:
-        """Accept a completed candle after boundary + duplicate validation."""
+        """Accept a completed candle after boundary, OHLCV, and dedupe checks."""
+        try:
+            ts = int(candle.ts)
+            if isinstance(candle.ts, bool) or float(candle.ts) != ts:
+                raise ValueError("candle timestamp must be an integer epoch")
+            start_dt = from_epoch(ts)
+        except (TypeError, ValueError, OverflowError, OSError):
+            log.warning("Dropped candle %s ts=%s: invalid timestamp", candle.security_id, candle.ts)
+            return None
         # 1. must start on a valid session boundary
-        start_dt = from_epoch(candle.ts)
         expected = candle_start_for(start_dt.replace(second=0, microsecond=0), self.interval)
         if expected is None:
             log.warning("Dropped candle %s ts=%s: outside session", candle.security_id, candle.ts)
             return None
-        if epoch(expected) != candle.ts:
+        if epoch(expected) != ts:
             log.warning(
                 "Dropped candle %s ts=%s: not on a %s-min boundary",
                 candle.security_id, candle.ts, self.interval,
             )
             return None
+        # Validate data before advancing the dedupe watermark. A corrected
+        # retransmission of a rejected malformed row may still be accepted.
+        if not self._valid_ohlcv(candle):
+            log.warning("Dropped candle %s ts=%s: invalid OHLCV", candle.security_id, ts)
+            return None
         # 2. duplicate / out-of-order protection
         last = self._last_closed_ts.get(candle.security_id)
-        if last is not None and candle.ts <= last:
+        if last is not None and ts <= last:
             return None
-        self._last_closed_ts[candle.security_id] = candle.ts
-        # sanity: OHLC consistency
-        if not (candle.low <= candle.open <= candle.high and
-                candle.low <= candle.close <= candle.high):
-            log.warning(
-                "Candle %s ts=%s OHLC inconsistent (h=%.2f l=%.2f o=%.2f c=%.2f)",
-                candle.security_id, candle.ts, candle.high, candle.low, candle.open, candle.close,
-            )
+        self._last_closed_ts[candle.security_id] = ts
         return candle
 
     # ------------------------------------------------------------- ticks
@@ -80,7 +119,24 @@ class CandleEngine:
         cum_volume: Optional[int] = None,
     ) -> None:
         """Build/maintain the in-progress candle from a live tick."""
-        dt = from_epoch(ts)
+        try:
+            price = float(price)
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("price must be finite and positive")
+            normalized_volume = (
+                None if cum_volume is None else self._nonnegative_count(cum_volume)
+            )
+            if cum_volume is not None and normalized_volume is None:
+                raise ValueError("cumulative volume must be a non-negative integer")
+            raw_ts = ts
+            ts = int(raw_ts)
+            if isinstance(raw_ts, bool) or float(raw_ts) != ts:
+                raise ValueError("tick timestamp must be an integer epoch")
+            dt = from_epoch(ts)
+        except (TypeError, ValueError, OverflowError, OSError):
+            log.warning("Dropped invalid tick for %s", security_id)
+            return
+        cum_volume = normalized_volume
         start = candle_start_for(dt, self.interval)
         if start is None:
             return  # outside session

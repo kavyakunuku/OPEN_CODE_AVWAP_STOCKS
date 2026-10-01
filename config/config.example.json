@@ -1,5 +1,5 @@
 {
-  "_comment": "AVWAP F&O option-selling system (stock options only). Copy to config.json and fill in your Dhan credentials. TRADING_MODE MUST be PAPER until the strategy is validated. LIVE requires explicit confirmation (see README).",
+  "_comment": "Phase 8 paper-trading only for F&O stock options. Fill in Dhan market-data credentials. LIVE mode is hard-disabled by the CLI and app; no live orders can be sent.",
   "trading_mode": "PAPER",
   "dhan": {
     "client_id": "",
@@ -37,14 +37,14 @@
   "liquidity": {
     "_comment": "Starter values only; validate with point-in-time historical data before use.",
     "weights": {
-      "volume": 0.30,
+      "volume": 0.3,
       "oi": 0.25,
-      "spread": 0.20,
+      "spread": 0.2,
       "depth": 0.15,
-      "consistency": 0.10
+      "consistency": 0.1
     },
-    "max_spread_percent": 0.50,
-    "preferred_spread_percent": 0.30,
+    "max_spread_percent": 0.5,
+    "preferred_spread_percent": 0.3,
     "max_quote_age_seconds": 60,
     "minimums": {
       "liquidity_score": null,
@@ -66,10 +66,10 @@
   "volatility": {
     "_comment": "Starter targets are illustrative only; calibrate against point-in-time history. This score never overrides liquidity qualification.",
     "weights": {
-      "atr_15m_percent": 0.40,
-      "realized_volatility": 0.30,
-      "intraday_volatility": 0.20,
-      "option_movement": 0.10
+      "atr_15m_percent": 0.4,
+      "realized_volatility": 0.3,
+      "intraday_volatility": 0.2,
+      "option_movement": 0.1
     },
     "normalization_targets": {
       "atr_15m_percent": 0.25,
@@ -90,12 +90,15 @@
     }
   },
   "opportunity": {
-    "_comment": "Scanner-only ranking; Phase 3 liquidity qualification is a hard gate and this module never places orders.",
+    "_comment": "Scanner selects new AVWAP candidates only. Set enabled=false to restore the unfiltered ATM/ITM scanner. It never creates signals or places orders.",
+    "enabled": true,
+    "refresh_minutes": 15,
+    "underlying_history_days": 90,
     "weights": {
-      "liquidity": 0.40,
-      "volatility": 0.30,
-      "chain_quality": 0.20,
-      "execution_quality": 0.10
+      "liquidity": 0.4,
+      "volatility": 0.3,
+      "chain_quality": 0.2,
+      "execution_quality": 0.1
     },
     "selection": {
       "max_stocks": 10,
@@ -103,26 +106,28 @@
       "max_top_opportunities": 10
     },
     "execution": {
-      "preferred_spread_percent": 0.30,
-      "max_spread_percent": 0.50,
+      "preferred_spread_percent": 0.3,
+      "max_spread_percent": 0.5,
       "max_quote_age_seconds": 60,
       "weights": {
-        "spread": 0.70,
-        "freshness": 0.30
+        "spread": 0.7,
+        "freshness": 0.3
       }
     }
   },
   "paper": {
-    "fill_mode": "candle_close",
-    "slippage_bps": 0,
-    "next_quote_timeout_seconds": 45
-  },
-  "live": {
-    "product_type": "MARGIN",
-    "order_type": "MARKET",
-    "limit_price_offset_ticks": 1,
-    "order_poll_seconds": 3,
-    "confirm_phrase": "I_UNDERSTAND_LIVE_TRADING"
+    "fill_mode": "marketable_quote",
+    "slippage_bps": 5.0,
+    "max_quote_age_seconds": 60,
+    "max_exit_candle_age_seconds": 1800,
+    "quote_fallback": "signal_candle_close",
+    "transaction_cost_per_order": 0.0,
+    "transaction_cost_bps": 0.0,
+    "margin_estimate_pct_of_underlying_notional": 20.0,
+    "report_dir": "reports/paper",
+    "_comment": "Fresh two-sided book fills cross at bid/ask (never mid), then adverse slippage/tick rounding. Stale/missing-book strategy fills use the explicitly recorded signal-candle-close fallback. Mechanical exits use a recent completed candle only within max_exit_candle_age_seconds; otherwise they remain open. Margin is indicative; costs are user-configured assumptions.",
+    "report_refresh_seconds": 300,
+    "exit_retry_seconds": 30
   },
   "risk": {
     "quantity_per_trade": null,

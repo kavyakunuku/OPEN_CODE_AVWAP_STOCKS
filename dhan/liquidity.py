@@ -141,10 +141,24 @@ def _quote_observation(quote) -> Optional[LiquidityObservation]:
     if isinstance(quote, Mapping):
         price = quote.get("price", quote.get("last_price"))
         volume = quote.get("cum_volume", quote.get("volume"))
+        open_interest = quote.get("open_interest", quote.get("oi"))
+        bid = quote.get("bid")
+        ask = quote.get("ask")
+        bid_quantity = quote.get("bid_quantity")
+        ask_quantity = quote.get("ask_quantity")
+        bid_depth = quote.get("bid_depth", ())
+        ask_depth = quote.get("ask_depth", ())
         timestamp = quote.get("ts", quote.get("observed_at"))
     else:
         price = getattr(quote, "price", getattr(quote, "last_price", None))
         volume = getattr(quote, "cum_volume", getattr(quote, "volume", None))
+        open_interest = getattr(quote, "open_interest", getattr(quote, "oi", None))
+        bid = getattr(quote, "bid", None)
+        ask = getattr(quote, "ask", None)
+        bid_quantity = getattr(quote, "bid_quantity", None)
+        ask_quantity = getattr(quote, "ask_quantity", None)
+        bid_depth = getattr(quote, "bid_depth", ())
+        ask_depth = getattr(quote, "ask_depth", ())
         timestamp = getattr(quote, "ts", getattr(quote, "observed_at", None))
     if isinstance(timestamp, datetime):
         observed_at = timestamp
@@ -160,6 +174,13 @@ def _quote_observation(quote) -> Optional[LiquidityObservation]:
         observed_at=observed_at,
         last_price=_as_float(price),
         volume=_as_float(volume),
+        open_interest=_as_float(open_interest),
+        bid=_as_float(bid),
+        ask=_as_float(ask),
+        bid_quantity=_as_float(bid_quantity),
+        ask_quantity=_as_float(ask_quantity),
+        bid_depth=tuple(_depth_level(level) for level in (bid_depth or ())),
+        ask_depth=tuple(_depth_level(level) for level in (ask_depth or ())),
     )
 
 

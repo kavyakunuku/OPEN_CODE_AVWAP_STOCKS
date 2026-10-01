@@ -1,21 +1,11 @@
-"""Dhan order placement, order status and position retrieval (live mode).
+"""Legacy Dhan order adapter, with order placement hard-disabled in Phase 8.
 
-    POST /v2/oddl/requests/order
-        body: {correlationId, clientOrderId, transactionType: BUY|SELL,
-               exchangeSegment: NSE_FNO, productType: MARGIN|INTRA_DAY|SWING,
-               orderType: MARKET|LIMIT|SL|SL-M, securityId, quantity, price,
-               validTill: DAY|IOC|DAY_3}
-        resp: {"orderId": "..."}
-    GET  /v2/oddl/requests/order/get/{orderId}  -> order status/fills
-    GET  /v2/positions                          -> held positions
-
-Never assume an order was filled just because it was sent (spec §27).
+Read-only status/position methods remain for compatibility; ``place`` raises
+before any REST request. This module is not imported by the Phase 8 app.
 """
 from __future__ import annotations
 
 import logging
-import uuid
-from typing import Optional
 
 log = logging.getLogger("avwap.dhan.orders")
 
@@ -35,34 +25,11 @@ class DhanOrders:
         trigger_price: float = 0.0,
         valid_till: str = "DAY",
     ) -> str:
-        if transaction_type not in ("BUY", "SELL"):
-            raise ValueError("transaction_type must be BUY or SELL")
-        if quantity <= 0:
-            raise ValueError("quantity must be > 0")
-        payload = {
-            "correlationId": uuid.uuid4().hex,
-            "clientOrderId": uuid.uuid4().hex[:16],
-            "transactionType": transaction_type,
-            "exchangeSegment": "NSE_FNO",
-            "productType": product_type,
-            "orderType": order_type,
-            "securityId": int(security_id),
-            "quantity": int(quantity),
-            "price": float(price),
-            "triggerPrice": float(trigger_price),
-            "validTill": valid_till,
-        }
-        resp = self.rest.post("/v2/oddl/requests/order", payload=payload)
-        order_id = (resp or {}).get("orderId")
-        if not order_id:
-            log.error("Dhan place order got no orderId; raw=%s payload=%s", resp, payload)
-            raise RuntimeError(f"Dhan did not return orderId: {resp}")
-        log.info(
-            "LIVE ORDER placed: %s %s qty=%d %s @%s -> orderId=%s",
-            transaction_type, security_id, quantity, order_type,
-            f"{price:g}" if price else "MKT", order_id,
+        """Hard stop for the legacy placement API during Phase 8."""
+        raise RuntimeError(
+            "Dhan live order placement is hard-disabled in Phase 8; "
+            "no order-placement endpoint may be called before Phase 9 approval"
         )
-        return order_id
 
     def status(self, order_id: str) -> dict:
         resp = self.rest.get(f"/v2/oddl/requests/order/get/{order_id}")

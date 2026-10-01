@@ -100,8 +100,15 @@ class Candle:
 class Quote:
     security_id: str
     price: float
-    cum_volume: int = 0
+    cum_volume: Optional[int] = 0
     ts: int = 0
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    bid_quantity: Optional[int] = None
+    ask_quantity: Optional[int] = None
+    open_interest: Optional[int] = None
+    bid_depth: list[dict] = field(default_factory=list)
+    ask_depth: list[dict] = field(default_factory=list)
 
 
 @dataclass

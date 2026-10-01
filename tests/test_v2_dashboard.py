@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from common.models import Candle  # noqa: E402
+from common.models import Candle, Quote  # noqa: E402
 from common.utils import IST, epoch  # noqa: E402
 from conftest import C  # noqa: E402
 from dhan.client import DhanAPIError, DhanREST  # noqa: E402
@@ -63,7 +63,7 @@ def make_app(tmp_path, at: datetime):
             "max_trades_per_day": 50, "max_daily_loss": 100000,
             "default_lot_size": 250,
         },
-        "paper": {"fill_mode": "candle_close", "slippage_bps": 0},
+        "paper": {"fill_mode": "marketable_quote", "slippage_bps": 0},
         "storage": {"db_path": str(tmp_path / "v2.db"),
                      "instrument_cache_dir": str(tmp_path / "inst")},
         "logging": {"level": "ERROR"},
@@ -215,6 +215,17 @@ def test_close_position_manual_paper(tmp_path):
     pos = app.positions.find_by_security(c.security_id)
     assert pos["status"] == "OPEN"
 
+    # A persisted entry price is not a valid invented exit quote.
+    unavailable = app.close_position_manual(pos["position_id"])
+    assert "not filled" in unavailable.lower()
+    assert app.db.get_position(pos["position_id"])["status"] == "OPEN"
+
+    # Manual close is allowed once a timestamped two-sided observation exists.
+    quote = Quote(
+        security_id=c.security_id, price=100.5, ts=epoch(clock.t),
+        bid=100.0, ask=101.0,
+    )
+    app._option_quote_cache[c.security_id] = quote
     msg = app.close_position_manual(pos["position_id"])
     assert "closed" in msg.lower()
     pos2 = app.db.get_position(pos["position_id"])

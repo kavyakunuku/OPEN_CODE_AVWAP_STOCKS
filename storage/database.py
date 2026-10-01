@@ -58,6 +58,27 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (candle_ts);
 
+CREATE TABLE IF NOT EXISTS evaluations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp          INTEGER NOT NULL,
+    candle_ts          INTEGER NOT NULL,
+    security_id        TEXT NOT NULL,
+    symbol             TEXT NOT NULL,
+    option             TEXT NOT NULL,
+    option_type        TEXT,
+    strike             REAL,
+    expiry             TEXT,
+    liquidity_score    REAL,
+    volatility_score   REAL,
+    opportunity_score  REAL,
+    scanner_timestamp  INTEGER,
+    avwap              REAL,
+    option_close       REAL NOT NULL,
+    signal             TEXT,
+    UNIQUE (security_id, candle_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_evaluations_ts ON evaluations (timestamp);
+
 CREATE TABLE IF NOT EXISTS positions (
     position_id   TEXT PRIMARY KEY,
     security_id   TEXT NOT NULL,
@@ -117,6 +138,115 @@ CREATE INDEX IF NOT EXISTS idx_journal_event_sec ON journal(event, security_id, 
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- Phase 8 paper-only execution audit: one immutable-ish row per simulated fill.
+CREATE TABLE IF NOT EXISTS paper_execution_events (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id           TEXT NOT NULL UNIQUE,
+    position_id        TEXT NOT NULL,
+    security_id        TEXT NOT NULL,
+    event_type         TEXT NOT NULL,
+    timestamp          INTEGER NOT NULL,
+    signal_timestamp   INTEGER,
+    signal_price       REAL,
+    fill_price         REAL,
+    bid                REAL,
+    ask                REAL,
+    spread_percent     REAL,
+    slippage_bps       REAL,
+    slippage_amount    REAL,
+    transaction_cost   REAL,
+    quantity           INTEGER NOT NULL,
+    lot_size           INTEGER,
+    avwap              REAL,
+    quote_timestamp    INTEGER,
+    quote_age_seconds  REAL,
+    execution_method   TEXT,
+    underlying_spot    REAL,
+    margin_estimate    REAL,
+    margin_model       TEXT,
+    raw                TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_paper_exec_ts ON paper_execution_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_paper_exec_position ON paper_execution_events(position_id, timestamp);
+
+-- Scanner decisions are persisted before the in-memory ranking can be replaced.
+CREATE TABLE IF NOT EXISTS paper_scanner_runs (
+    scan_id               TEXT PRIMARY KEY,
+    timestamp             INTEGER NOT NULL,
+    trading_date          TEXT NOT NULL,
+    status                TEXT NOT NULL,
+    stocks_scanned        INTEGER NOT NULL DEFAULT 0,
+    contracts_scanned     INTEGER NOT NULL DEFAULT 0,
+    qualified_contracts  INTEGER NOT NULL DEFAULT 0,
+    rejected_contracts   INTEGER NOT NULL DEFAULT 0,
+    selected_contracts   INTEGER NOT NULL DEFAULT 0,
+    duration_ms           REAL,
+    symbols_json          TEXT NOT NULL DEFAULT '[]',
+    error                 TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_paper_scan_ts ON paper_scanner_runs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_paper_scan_date ON paper_scanner_runs(trading_date, timestamp);
+
+CREATE TABLE IF NOT EXISTS paper_scanner_candidates (
+    scan_id             TEXT NOT NULL,
+    security_id         TEXT NOT NULL,
+    symbol              TEXT,
+    contract_name       TEXT,
+    expiry              TEXT,
+    strike              REAL,
+    option_type         TEXT,
+    status              TEXT NOT NULL,
+    qualified           INTEGER NOT NULL DEFAULT 0,
+    selected_for_avwap  INTEGER NOT NULL DEFAULT 0,
+    rank                INTEGER,
+    liquidity_score     REAL,
+    volatility_score    REAL,
+    opportunity_score   REAL,
+    spread_percent      REAL,
+    quote_age_seconds   REAL,
+    rejection_reasons   TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (scan_id, security_id)
+);
+CREATE INDEX IF NOT EXISTS idx_paper_scan_candidates_status ON paper_scanner_candidates(status);
+
+CREATE TABLE IF NOT EXISTS paper_errors (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp         INTEGER NOT NULL,
+    trading_date      TEXT NOT NULL,
+    session_id        TEXT,
+    component         TEXT NOT NULL,
+    severity          TEXT NOT NULL DEFAULT 'ERROR',
+    code              TEXT NOT NULL,
+    message           TEXT NOT NULL,
+    recovery_action   TEXT,
+    recovered         INTEGER NOT NULL DEFAULT 0,
+    context_json      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_paper_errors_ts ON paper_errors(timestamp);
+CREATE INDEX IF NOT EXISTS idx_paper_errors_date ON paper_errors(trading_date, timestamp);
+
+CREATE TABLE IF NOT EXISTS paper_position_marks (
+    position_id       TEXT PRIMARY KEY,
+    security_id       TEXT NOT NULL,
+    observed_at       INTEGER NOT NULL,
+    last_price        REAL,
+    bid               REAL,
+    ask               REAL,
+    spread_percent    REAL,
+    quote_age_seconds REAL,
+    avwap             REAL,
+    unrealized_pnl    REAL,
+    mark_source       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_paper_marks_observed ON paper_position_marks(observed_at);
+
+CREATE TABLE IF NOT EXISTS paper_daily_reports (
+    trading_date TEXT PRIMARY KEY,
+    generated_at INTEGER NOT NULL,
+    report_dir   TEXT NOT NULL,
+    summary_json TEXT NOT NULL
 );
 """
 
@@ -233,6 +363,48 @@ class Database:
         return self._query(
             "SELECT * FROM signals WHERE security_id=? ORDER BY candle_ts DESC, id DESC LIMIT ?",
             (security_id, limit),
+        )
+
+    # ----------------------------------------------------------- evaluations
+    def save_evaluation(self, row: dict) -> None:
+        """Persist the audit record for one completed-candle AVWAP evaluation.
+
+        The contract/candle key makes retries idempotent; a duplicate delivery
+        cannot manufacture an extra evaluation row for the same 15-minute bar.
+        """
+        self._exec(
+            """INSERT INTO evaluations (
+                    timestamp, candle_ts, security_id, symbol, option, option_type,
+                    strike, expiry, liquidity_score, volatility_score,
+                    opportunity_score, scanner_timestamp, avwap, option_close, signal
+                ) VALUES (
+                    :timestamp, :candle_ts, :security_id, :symbol, :option,
+                    :option_type, :strike, :expiry, :liquidity_score,
+                    :volatility_score, :opportunity_score, :scanner_timestamp,
+                    :avwap, :option_close, :signal
+                )
+                ON CONFLICT(security_id, candle_ts) DO UPDATE SET
+                    timestamp=excluded.timestamp,
+                    symbol=excluded.symbol,
+                    option=excluded.option,
+                    option_type=excluded.option_type,
+                    strike=excluded.strike,
+                    expiry=excluded.expiry,
+                    liquidity_score=excluded.liquidity_score,
+                    volatility_score=excluded.volatility_score,
+                    opportunity_score=excluded.opportunity_score,
+                    scanner_timestamp=excluded.scanner_timestamp,
+                    avwap=excluded.avwap,
+                    option_close=excluded.option_close,
+                    signal=excluded.signal""",
+            row,
+        )
+
+    def get_evaluations(self, limit: int = 100, since_ts: int = 0):
+        return self._query(
+            "SELECT * FROM evaluations WHERE timestamp>=? "
+            "ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (since_ts, limit),
         )
 
     # ------------------------------------------------------------ positions
@@ -415,6 +587,289 @@ class Database:
             return json.loads(rows[0]["value"])
         except (TypeError, ValueError):
             return default
+
+    # ---------------------------------------------------------- Phase 8 paper
+    def record_paper_execution(self, event: dict) -> None:
+        """Persist one simulated fill with its actual quote/fallback assumptions."""
+        raw = event.get("raw", {})
+        self._exec(
+            """INSERT INTO paper_execution_events (
+                    order_id, position_id, security_id, event_type, timestamp,
+                    signal_timestamp, signal_price, fill_price, bid, ask,
+                    spread_percent, slippage_bps, slippage_amount,
+                    transaction_cost, quantity, lot_size, avwap, quote_timestamp,
+                    quote_age_seconds, execution_method, underlying_spot,
+                    margin_estimate, margin_model, raw
+                ) VALUES (
+                    :order_id, :position_id, :security_id, :event_type, :timestamp,
+                    :signal_timestamp, :signal_price, :fill_price, :bid, :ask,
+                    :spread_percent, :slippage_bps, :slippage_amount,
+                    :transaction_cost, :quantity, :lot_size, :avwap, :quote_timestamp,
+                    :quote_age_seconds, :execution_method, :underlying_spot,
+                    :margin_estimate, :margin_model, :raw
+                ) ON CONFLICT(order_id) DO UPDATE SET
+                    position_id=excluded.position_id,
+                    security_id=excluded.security_id,
+                    event_type=excluded.event_type,
+                    timestamp=excluded.timestamp,
+                    signal_timestamp=excluded.signal_timestamp,
+                    signal_price=excluded.signal_price,
+                    fill_price=excluded.fill_price,
+                    bid=excluded.bid, ask=excluded.ask,
+                    spread_percent=excluded.spread_percent,
+                    slippage_bps=excluded.slippage_bps,
+                    slippage_amount=excluded.slippage_amount,
+                    transaction_cost=excluded.transaction_cost,
+                    quantity=excluded.quantity, lot_size=excluded.lot_size,
+                    avwap=excluded.avwap, quote_timestamp=excluded.quote_timestamp,
+                    quote_age_seconds=excluded.quote_age_seconds,
+                    execution_method=excluded.execution_method,
+                    underlying_spot=excluded.underlying_spot,
+                    margin_estimate=excluded.margin_estimate,
+                    margin_model=excluded.margin_model, raw=excluded.raw""",
+            {
+                **{key: event.get(key) for key in (
+                    "order_id", "position_id", "security_id", "event_type", "timestamp",
+                    "signal_timestamp", "signal_price", "fill_price", "bid", "ask",
+                    "spread_percent", "slippage_bps", "slippage_amount",
+                    "transaction_cost", "quantity", "lot_size", "avwap",
+                    "quote_timestamp", "quote_age_seconds", "execution_method",
+                    "underlying_spot", "margin_estimate", "margin_model",
+                )},
+                "raw": json.dumps(raw, default=str, sort_keys=True),
+            },
+        )
+
+    def get_paper_execution_events(
+        self, *, position_id: str | None = None, start_ts: int = 0,
+        end_ts: int | None = None, event_type: str | None = None, limit: int = 100000,
+    ) -> list[dict]:
+        sql = "SELECT * FROM paper_execution_events WHERE timestamp>=?"
+        params: list = [int(start_ts)]
+        if end_ts is not None:
+            sql += " AND timestamp<=?"
+            params.append(int(end_ts))
+        if position_id is not None:
+            sql += " AND position_id=?"
+            params.append(str(position_id))
+        if event_type is not None:
+            sql += " AND event_type=?"
+            params.append(str(event_type))
+        sql += " ORDER BY timestamp, id LIMIT ?"
+        params.append(int(limit))
+        out = []
+        for row in self._query(sql, tuple(params)):
+            item = dict(row)
+            try:
+                item["raw"] = json.loads(item.get("raw") or "{}")
+            except (TypeError, ValueError):
+                item["raw"] = {}
+            out.append(item)
+        return out
+
+    def get_paper_execution_for_position(self, position_id: str) -> list[dict]:
+        return self.get_paper_execution_events(position_id=position_id)
+
+    def record_paper_scan(self, scan: dict, candidates: list[dict] | None = None) -> None:
+        """Atomically persist one complete ranking snapshot and its contract rows."""
+        candidates = candidates or []
+        now = int(scan["timestamp"])
+        values = (
+            str(scan["scan_id"]), now, str(scan["trading_date"]),
+            str(scan.get("status", "completed")), int(scan.get("stocks_scanned", 0)),
+            int(scan.get("contracts_scanned", 0)), int(scan.get("qualified_contracts", 0)),
+            int(scan.get("rejected_contracts", 0)), int(scan.get("selected_contracts", 0)),
+            scan.get("duration_ms"),
+            json.dumps(scan.get("symbols", []), default=str, sort_keys=True),
+            scan.get("error"),
+        )
+        candidate_values = []
+        for row in candidates:
+            candidate_values.append((
+                str(scan["scan_id"]), str(row.get("security_id", "")),
+                row.get("symbol"), row.get("contract_name"), row.get("expiry"),
+                row.get("strike"), row.get("option_type"),
+                str(row.get("status", "UNKNOWN")), int(bool(row.get("qualified"))),
+                int(bool(row.get("selected_for_avwap"))), row.get("rank"),
+                row.get("liquidity_score"), row.get("volatility_score"),
+                row.get("opportunity_score"), row.get("spread_percent"),
+                row.get("quote_age_seconds"),
+                json.dumps(row.get("rejection_reasons", []), default=str),
+            ))
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO paper_scanner_runs (
+                        scan_id, timestamp, trading_date, status, stocks_scanned,
+                        contracts_scanned, qualified_contracts, rejected_contracts,
+                        selected_contracts, duration_ms, symbols_json, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+                self._conn.execute(
+                    "DELETE FROM paper_scanner_candidates WHERE scan_id=?",
+                    (str(scan["scan_id"]),),
+                )
+                if candidate_values:
+                    self._conn.executemany(
+                        """INSERT INTO paper_scanner_candidates (
+                            scan_id, security_id, symbol, contract_name, expiry,
+                            strike, option_type, status, qualified,
+                            selected_for_avwap, rank, liquidity_score,
+                            volatility_score, opportunity_score, spread_percent,
+                            quote_age_seconds, rejection_reasons
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        candidate_values,
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def get_paper_scanner_runs(self, trading_date: str | None = None) -> list[dict]:
+        if trading_date is None:
+            rows = self._query("SELECT * FROM paper_scanner_runs ORDER BY timestamp, scan_id")
+        else:
+            rows = self._query(
+                "SELECT * FROM paper_scanner_runs WHERE trading_date=? ORDER BY timestamp, scan_id",
+                (str(trading_date),),
+            )
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["symbols"] = json.loads(item.pop("symbols_json") or "[]")
+            except (TypeError, ValueError):
+                item["symbols"] = []
+            out.append(item)
+        return out
+
+    def get_paper_scanner_candidates(
+        self, *, scan_id: str | None = None, trading_date: str | None = None,
+        limit: int = 100000,
+    ) -> list[dict]:
+        sql = "SELECT c.* FROM paper_scanner_candidates c"
+        params: list = []
+        if trading_date is not None:
+            sql += " JOIN paper_scanner_runs r ON r.scan_id=c.scan_id WHERE r.trading_date=?"
+            params.append(str(trading_date))
+        elif scan_id is not None:
+            sql += " WHERE c.scan_id=?"
+            params.append(str(scan_id))
+        sql += " ORDER BY c.scan_id, c.symbol, c.security_id LIMIT ?"
+        params.append(int(limit))
+        out = []
+        for row in self._query(sql, tuple(params)):
+            item = dict(row)
+            for key in ("qualified", "selected_for_avwap"):
+                item[key] = bool(item.get(key))
+            try:
+                item["rejection_reasons"] = json.loads(item.get("rejection_reasons") or "[]")
+            except (TypeError, ValueError):
+                item["rejection_reasons"] = []
+            out.append(item)
+        return out
+
+    def record_paper_error(self, event: dict) -> None:
+        self._exec(
+            """INSERT INTO paper_errors (
+                timestamp, trading_date, session_id, component, severity,
+                code, message, recovery_action, recovered, context_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(event["timestamp"]), str(event["trading_date"]),
+                event.get("session_id"), str(event.get("component", "runtime")),
+                str(event.get("severity", "ERROR")), str(event.get("code", "PAPER_ERROR")),
+                str(event.get("message", ""))[:2000], event.get("recovery_action"),
+                int(bool(event.get("recovered", False))),
+                json.dumps(event.get("context", {}), default=str, sort_keys=True),
+            ),
+        )
+
+    def get_paper_errors(self, trading_date: str | None = None, limit: int = 10000) -> list[dict]:
+        if trading_date is None:
+            rows = self._query(
+                "SELECT * FROM paper_errors ORDER BY timestamp, id LIMIT ?", (int(limit),)
+            )
+        else:
+            rows = self._query(
+                "SELECT * FROM paper_errors WHERE trading_date=? ORDER BY timestamp, id LIMIT ?",
+                (str(trading_date), int(limit)),
+            )
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["recovered"] = bool(item.get("recovered"))
+            try:
+                item["context"] = json.loads(item.pop("context_json") or "{}")
+            except (TypeError, ValueError):
+                item["context"] = {}
+            out.append(item)
+        return out
+
+    def save_paper_position_mark(self, mark: dict) -> None:
+        self._exec(
+            """INSERT INTO paper_position_marks (
+                position_id, security_id, observed_at, last_price, bid, ask,
+                spread_percent, quote_age_seconds, avwap, unrealized_pnl, mark_source
+            ) VALUES (
+                :position_id, :security_id, :observed_at, :last_price, :bid, :ask,
+                :spread_percent, :quote_age_seconds, :avwap, :unrealized_pnl, :mark_source
+            ) ON CONFLICT(position_id) DO UPDATE SET
+                security_id=excluded.security_id, observed_at=excluded.observed_at,
+                last_price=excluded.last_price, bid=excluded.bid, ask=excluded.ask,
+                spread_percent=excluded.spread_percent,
+                quote_age_seconds=excluded.quote_age_seconds, avwap=excluded.avwap,
+                unrealized_pnl=excluded.unrealized_pnl, mark_source=excluded.mark_source""",
+            mark,
+        )
+
+    def get_paper_position_marks(self) -> dict[str, dict]:
+        return {str(row["position_id"]): dict(row)
+                for row in self._query("SELECT * FROM paper_position_marks")}
+
+    def save_paper_daily_report(self, trading_date: str, generated_at: int,
+                                report_dir: str, summary: dict) -> None:
+        self._exec(
+            """INSERT INTO paper_daily_reports (trading_date, generated_at, report_dir, summary_json)
+               VALUES (?, ?, ?, ?) ON CONFLICT(trading_date) DO UPDATE SET
+                 generated_at=excluded.generated_at, report_dir=excluded.report_dir,
+                 summary_json=excluded.summary_json""",
+            (str(trading_date), int(generated_at), str(report_dir),
+             json.dumps(summary, default=str, sort_keys=True)),
+        )
+
+    def get_paper_daily_reports(self, limit: int = 1000) -> list[dict]:
+        rows = self._query(
+            "SELECT * FROM paper_daily_reports ORDER BY trading_date DESC LIMIT ?",
+            (int(limit),),
+        )
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["summary"] = json.loads(item.pop("summary_json") or "{}")
+            except (TypeError, ValueError):
+                item["summary"] = {}
+            out.append(item)
+        return out
+
+    def get_paper_trading_dates(self) -> list[str]:
+        """Return all IST dates represented by scanner, execution, position, error, or report data."""
+        rows = self._query(
+            """SELECT trading_date FROM paper_scanner_runs
+               UNION SELECT trading_date FROM paper_errors
+               UNION SELECT date(timestamp, 'unixepoch', '+5 hours', '+30 minutes')
+                     FROM paper_execution_events
+               UNION SELECT date(entry_time, 'unixepoch', '+5 hours', '+30 minutes')
+                     FROM positions WHERE mode='PAPER' AND entry_time IS NOT NULL
+               UNION SELECT date(exit_time, 'unixepoch', '+5 hours', '+30 minutes')
+                     FROM positions WHERE mode='PAPER' AND exit_time IS NOT NULL
+               UNION SELECT trading_date FROM paper_daily_reports
+               ORDER BY 1"""
+        )
+        return [str(row["trading_date"]) for row in rows if row["trading_date"]]
 
     # ----------------------------------------------------------- analytics
     def trades_today_count(self, ist_day_str: str) -> int:

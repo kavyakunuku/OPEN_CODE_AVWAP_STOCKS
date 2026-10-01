@@ -84,7 +84,13 @@ def test_dhan_adapter_combines_captured_chain_quote_and_project_contract():
     }
     chain = parse_chain_response(payload, observed_at=CAPTURED_AT)
     quote_at = CAPTURED_AT + timedelta(seconds=5)
-    quote = Quote("12345", 5.02, cum_volume=475, ts=epoch(quote_at))
+    quote = Quote(
+        "12345", 5.02, cum_volume=475, ts=epoch(quote_at),
+        bid=5.01, ask=5.02, bid_quantity=40, ask_quantity=50,
+        open_interest=1300,
+        bid_depth=[{"price": 5.01, "quantity": 40}, {"price": 5.00, "quantity": 30}],
+        ask_depth=[{"price": 5.02, "quantity": 50}, {"price": 5.03, "quantity": 30}],
+    )
     data = DhanLiquidityAdapter().from_option_chain(
         [_contract()], chain, quote_snapshots={"12345": quote}
     )
@@ -93,10 +99,10 @@ def test_dhan_adapter_combines_captured_chain_quote_and_project_contract():
 
     assert result.last_price == 5.02
     assert result.volume == 475
-    assert result.open_interest == 1200
+    assert result.open_interest == 1300
     assert result.oi_change == 50
-    assert result.depth == 20
-    assert result.premium == 5.0  # executable sell-side bid
+    assert result.depth == 70  # both live bid levels, capped by total ask depth
+    assert result.premium == 5.01  # fresh executable sell-side bid
     assert result.observation_at == quote_at
     assert result.qualified is True
 

@@ -1,7 +1,14 @@
 __pycache__/
+.venv/
 *.pyc
 .pytest_cache/
 data/
+reports/
 logs/
 config/config.json
 !config/config.example.json
+config/config.json.bak
+
+# Generated source export (not part of the Git source tree)
+/OPEN_CODE_AVWAP_STOCKS_PAPER.zip
+/OPEN_CODE_AVWAP_STOCKS_PAPER.zip.sha256

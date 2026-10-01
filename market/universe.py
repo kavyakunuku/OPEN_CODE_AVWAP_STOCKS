@@ -180,6 +180,9 @@ class UniverseManager:
         self.it_count = it_count
         self.by_underlying: dict[str, UnderlyingUniverse] = {}
         self.position_security_ids: set[str] = set()
+        # None means legacy ATM/ITM candidates; a concrete set (including an
+        # empty set) is the opportunity scanner's new-entry allow-list.
+        self._eligible_scanner_ids: Optional[set[str]] = None
         # the bootstrap/main thread mutates the universe while the dashboard
         # thread reads it - serialize structural access
         self._lock = threading.RLock()
@@ -251,8 +254,24 @@ class UniverseManager:
         with self._lock:
             self.position_security_ids.discard(security_id)
 
+    def set_eligible_scanner_ids(self, security_ids: Optional[set[str] | list[str] | tuple[str, ...]]) -> None:
+        """Replace the new-entry allow-list without changing position monitoring.
+
+        ``None`` disables the opportunity filter and restores the legacy
+        ATM/ITM candidate set. An empty collection is an active fail-closed
+        filter: no new contract is eligible, while open positions stay
+        monitored through :meth:`monitored_ids`.
+        """
+        with self._lock:
+            self._eligible_scanner_ids = (
+                None if security_ids is None
+                else {str(security_id) for security_id in security_ids if str(security_id)}
+            )
+
     def scanner_ids(self) -> set[str]:
         with self._lock:
+            if self._eligible_scanner_ids is not None:
+                return set(self._eligible_scanner_ids)
             ids = set()
             for u in self.by_underlying.values():
                 for c in u.scanner_contracts():

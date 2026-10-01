@@ -98,6 +98,9 @@ DEFAULTS: dict = {
         },
     },
     "opportunity": {
+        "enabled": True,
+        "refresh_minutes": 15,
+        "underlying_history_days": 90,
         "weights": {
             "liquidity": 0.40,
             "volatility": 0.30,
@@ -120,16 +123,17 @@ DEFAULTS: dict = {
         },
     },
     "paper": {
-        "fill_mode": "candle_close",
-        "slippage_bps": 0,
-        "next_quote_timeout_seconds": 45,
-    },
-    "live": {
-        "product_type": "MARGIN",
-        "order_type": "MARKET",
-        "limit_price_offset_ticks": 1,
-        "order_poll_seconds": 3,
-        "confirm_phrase": "I_UNDERSTAND_LIVE_TRADING",
+        "fill_mode": "marketable_quote",
+        "slippage_bps": 5.0,
+        "max_quote_age_seconds": 60,
+        "max_exit_candle_age_seconds": 1800,
+        "quote_fallback": "signal_candle_close",
+        "transaction_cost_per_order": 0.0,
+        "transaction_cost_bps": 0.0,
+        "margin_estimate_pct_of_underlying_notional": 20.0,
+        "report_dir": "reports/paper",
+        "report_refresh_seconds": 300,
+        "exit_retry_seconds": 30,
     },
     "risk": {
         "quantity_per_trade": None,

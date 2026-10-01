@@ -6,7 +6,7 @@ signal may become an order, and provide the emergency controls:
     * quantity per trade          (default: the contract's lot size)
     * max open positions
     * max trades per day
-    * max daily loss (realized today + unrealized at LTP)
+    * max daily loss (realized today + unrealized at fresh LTP; fail closed when unpriced)
     * disable new entries (manual switch)
     * emergency stop              (blocks ALL new entries; exits still work)
     * exit all positions          (operational action, not a strategy signal)
@@ -16,6 +16,7 @@ Flags persist in the kv table so they survive restarts.
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 log = logging.getLogger("avwap.portfolio.risk")
@@ -45,21 +46,51 @@ class RiskManager:
         log.warning("New entries %s", "DISABLED" if on else "enabled")
 
     # ------------------------------------------------------------ quantity
+    @staticmethod
+    def _positive_integer(value) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or number <= 0 or not number.is_integer():
+            return None
+        return int(number)
+
     def quantity_for(self, contract, cfg_quantity: int | None = None) -> int:
+        """Return a valid contract-lot multiple, or zero for bad sizing config."""
+        lot = self._positive_integer(getattr(contract, "lot_size", None))
+        if lot is None:
+            lot = self._positive_integer(self.cfg.get("default_lot_size", 250)) or 250
+
         q = cfg_quantity
         if q is None:
             q = self.cfg.get("quantity_per_trade")
-        if q and int(q) > 0:
-            return int(q)
-        lot = getattr(contract, "lot_size", 0) or int(self.cfg.get("default_lot_size", 250))
-        return int(lot)
+        if q is None or q == "":
+            return lot
+
+        configured = self._positive_integer(q)
+        if configured is not None:
+            return configured if configured % lot == 0 else 0
+
+        # Preserve the existing default-lot behavior for non-positive values;
+        # positive fractional/malformed values fail closed instead of rounding
+        # into a quantity that differs from the operator's explicit setting.
+        try:
+            number = float(q)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if not math.isfinite(number) or number > 0:
+            return 0
+        return lot
 
     # --------------------------------------------------------------- gates
     def entry_block_reasons(
         self,
         open_positions: int,
         trades_today: int,
-        daily_pnl: float,
+        daily_pnl: float | None,
     ) -> list[str]:
         reasons = []
         f = self.flags()
@@ -74,16 +105,37 @@ class RiskManager:
         if max_trades and trades_today >= max_trades:
             reasons.append(f"MAX_TRADES_PER_DAY({max_trades})")
         max_loss = float(self.cfg.get("max_daily_loss", 0) or 0)
-        if max_loss and daily_pnl <= -abs(max_loss):
-            reasons.append(f"MAX_DAILY_LOSS({max_loss:g})")
+        if max_loss:
+            if daily_pnl is None:
+                reasons.append("UNPRICED_OPEN_POSITION_DRAWDOWN_GATE")
+            elif daily_pnl <= -abs(max_loss):
+                reasons.append(f"MAX_DAILY_LOSS({max_loss:g})")
         return reasons
 
-    def daily_pnl(self, ist_day: str, open_positions: list[dict], ltp_getter) -> float:
-        """Realized today + unrealized at current LTP (conservative gate)."""
+    def daily_pnl(self, ist_day: str, open_positions: list[dict], ltp_getter) -> float | None:
+        """Return realized + fully marked unrealized P&L, or None if incomplete."""
         realized = self.db.realized_pnl_today(ist_day)
+        try:
+            realized = float(realized)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(realized):
+            return None
         unreal = 0.0
-        for p in open_positions:
-            ltp = ltp_getter(p["security_id"])
-            if ltp and p.get("entry_price") is not None:
-                unreal += (p["entry_price"] - ltp) * p["quantity"]
+        for position in open_positions:
+            entry = position.get("entry_price")
+            ltp = ltp_getter(position["security_id"])
+            quantity = position.get("quantity")
+            if entry is None or ltp is None or quantity is None:
+                return None
+            try:
+                entry, ltp = float(entry), float(ltp)
+                quantity_number = float(quantity)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if (not math.isfinite(entry) or not math.isfinite(ltp)
+                    or not math.isfinite(quantity_number) or quantity_number <= 0
+                    or not quantity_number.is_integer()):
+                return None
+            unreal += (entry - ltp) * int(quantity_number)
         return realized + unreal

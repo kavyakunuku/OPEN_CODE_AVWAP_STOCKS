@@ -1,7 +1,7 @@
 """Web dashboard V2 (Flask) - Trading Command Center.
 
-Four zones (spec: V2 roadmap, LIVE TRADING + DATA + OPERATIONS):
-  LIVE TRADING : Overview · Scanner · Contract detail (chart) ·
+Four zones (Phase 8 paper-only dashboard + DATA + OPERATIONS):
+  PAPER TRADING: Overview · Scanner · Contract detail (chart) ·
                  Positions (operational) · Signals (with explainability +
                  signal->order->position chain) · Orders
   DATA         : Data Health (feeds, REST, AVWAP integrity, rebuild queue)
@@ -167,13 +167,13 @@ pre { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:1
     <button class="primary small" onclick="ctrl('enable_entries')">Resume entries</button>
     <button class="danger small" onclick="ctrl('emergency_stop')">EMERGENCY STOP</button>
     <button class="primary small" onclick="ctrl('release_stop')">Release stop</button>
-    <button class="danger small" onclick="ctrl('exit_all')">EXIT ALL</button>
+    <button class="danger small" onclick="ctrl('exit_all')">PAPER EXIT ALL</button>
     <span class="small" id="ctrl_status"></span>
   </div>
 </div>
 <div id="layout">
 <nav id="nav">
-  <div class="navgroup">LIVE TRADING</div>
+  <div class="navgroup">PHASE 8 PAPER TRADING</div>
   <a data-page="overview" class="active">Overview</a>
   <a data-page="scanner">Scanner</a>
   <a data-page="contract">Contract</a>
@@ -199,6 +199,9 @@ pre { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:1
   <div id="ov_market"></div>
   <h2>Engine</h2>
   <div class="cards" id="ov_engine"></div>
+  <h2>Phase 8 paper audit</h2>
+  <div class="cards" id="ov_paper"></div>
+  <div class="small" id="ov_paper_report"></div>
   <h2>Risk</h2>
   <div class="cards" id="ov_risk"></div>
   <h2>Alerts <a class="small" onclick="showPage('alerts')" style="float:right;">view all →</a></h2>
@@ -532,10 +535,10 @@ function renderHeader() {
     return;
   }
   bp.style.display = "none";
-  if (S.mode === "LIVE") { b.className = "banner live"; b.textContent = "⚠ LIVE TRADING ENABLED — REAL ORDERS MAY BE SENT TO DHAN"; }
-  else { b.className = "banner paper"; b.textContent = "PAPER TRADING MODE — no live orders are sent (data source: " + (S.source === "mock" ? "MOCK/synthetic" : "Dhan live market data") + ")"; }
+  b.className = "banner paper";
+  b.textContent = "PHASE 8 PAPER-ONLY — live order placement is hard-disabled (data source: " + (S.source === "mock" ? "MOCK/synthetic" : "Dhan live market data") + ")";
   const now = Date.now() / 1000;
-  const m = $("c_mode"); m.textContent = S.mode; m.className = "chip " + (S.mode === "LIVE" ? "live" : "info");
+  const m = $("c_mode"); m.textContent = "PAPER"; m.className = "chip info";
   const mk = $("c_market"); mk.textContent = "Market " + S.market_state;
   mk.className = "chip " + (S.market_state === "OPEN" ? "ok" : "warn");
   const eng = S.system && S.system.engine;
@@ -596,7 +599,7 @@ function renderOverview() {
     ["Win / Loss (today)", (sum.wins_today ?? 0) + " / " + (sum.losses_today ?? 0)],
     ["Unrealized P&L", inr(sum.unrealized), (sum.unrealized||0) < 0 ? "err" : "ok"],
     ["Realized (today)", inr(sum.realized_today), (sum.realized_today||0) < 0 ? "err" : "ok"],
-    ["Exposure", inr(sum.exposure), "", "notional premium (margin: LIVE only)"],
+    ["Exposure", inr(sum.exposure), "", "option premium notional; indicative margin in daily report"],
   ]);
   let idxHtml = "";
   for (const [u, d] of Object.entries(S.indices || {})) {
@@ -618,6 +621,19 @@ function renderOverview() {
     ["Engine heartbeat", sys.engine && sys.engine.last_tick ? ago(sys.engine.last_tick) : "–", sys.engine && sys.engine.last_error ? "err" : "ok", sys.engine && sys.engine.last_error ? String(sys.engine.last_error).slice(0, 60) : ""],
     ["Version", S.version || "–"],
   ]);
+  const paper = S.paper || {}, lastScan = paper.last_scan || {};
+  const reportRow = paper.latest_daily_report || {}, daily = reportRow.summary || {};
+  $("ov_paper").innerHTML = cardRow([
+    ["Execution", "PAPER only", "ok", "live order placement hard-disabled"],
+    ["Scanner", paper.scanner_status || "–", paper.scanner_error ? "err" : "", paper.scanner_error || "Dhan Phase 2–5 refresh"],
+    ["Latest scan", lastScan.timestamp ? ts(lastScan.timestamp) : "–", lastScan.status === "failed" ? "err" : "", (lastScan.contracts_scanned ?? "–") + " contracts · " + (lastScan.selected_contracts ?? "–") + " selected"],
+    ["Today's paper trades", daily.paper_trades ?? 0],
+    ["Daily realized net P&L", daily.realized_net_pnl == null ? "–" : inr(daily.realized_net_pnl), (daily.realized_net_pnl || 0) < 0 ? "err" : "ok"],
+  ]);
+  const reportDay = encodeURIComponent(daily.trading_date || new Date().toISOString().slice(0, 10));
+  $("ov_paper_report").innerHTML = reportRow.trading_date
+    ? 'Report date ' + reportRow.trading_date + ' · <a href="/api/paper-report?date=' + reportDay + '" target="_blank">open JSON report summary</a> · output directory: ' + esc(paper.report_dir || "reports/paper")
+    : 'No saved daily report yet · reports will appear in ' + esc(paper.report_dir || "reports/paper");
   const lossLimit = risk.max_daily_loss ? Math.min(1, Math.abs(risk.daily_pnl || 0) / Math.abs(risk.max_daily_loss)) * (risk.daily_pnl < 0 ? 100 : 0) : 0;
   $("ov_risk").innerHTML = cardRow([
     ["Daily loss used", Math.abs(lossLimit).toFixed(0) + " % of " + inr(risk.max_daily_loss), lossLimit > 75 ? "err" : lossLimit > 50 ? "warn" : "ok", "intraday loss limit"],
@@ -961,7 +977,7 @@ function renderSystem() {
   $("sys_comp").innerHTML = cardRow([
     ["Engine", eng.last_tick ? (engStale ? '<span class="warn">STALE</span>' : '<span class="ok">RUNNING</span>') : "–", eng.last_error ? "err" : ""],
     ["Strategy", (S.scanner || []).length ? '<span class="ok">OK</span>' : "–", "", (S.scanner || []).length + " monitored"],
-    ["Execution", S.mode, S.mode === "LIVE" ? "err" : "ok", S.mode === "LIVE" ? "real orders" : "virtual fills"],
+    ["Execution", "PAPER", "ok", "virtual fills; live order placement disabled"],
     ["Database", sys.db && sys.db.ok ? '<span class="ok">OK</span>' : "–", "", sys.db ? sys.db.size_mb + " MB" : ""],
     ["Dashboard", '<span class="ok">OK</span>', "", "build " + (S.version || "?")],
   ]);
@@ -1106,13 +1122,13 @@ function renderSettings() {
       '<div class="k">' + p[0] + '</div><div>' + (typeof p[1] === "object" ? JSON.stringify(p[1]) : p[1]) + "</div>").join("");
     return "<h2>" + title + '</h2><div class="kv">' + (rows || '<div class="dim">—</div>') + "</div>";
   };
-  const m = st.market_data || {}, s2 = st.strategy || {}, r = st.risk || {}, p = st.paper || {}, lv = st.live || {}, sd = st.storage || {};
+  const m = st.market_data || {}, s2 = st.strategy || {}, r = st.risk || {}, p = st.paper || {}, sd = st.storage || {};
   $("set_tables").innerHTML =
     sec("Strategy", [["candle interval (min)", s2.candle_interval_minutes], ["ITM strikes per side", s2.itm_strikes_per_side], ["expiry switch day", s2.expiry_switch_day]]) +
     sec("Market data", [["source", m.source], ["LTP poll (s)", m.ltp_poll_seconds], ["universe refresh (min)", m.universe_refresh_minutes], ["loop tick (s)", m.loop_tick_seconds], ["universe stocks", m.universe_stocks_count], ["universe indices", (m.universe_indices || []).join(", ")], ["weekly expiries", m.weekly_expiries], ["history start", m.history_start]]) +
     sec("Risk", [["quantity per trade", r.quantity_per_trade], ["max open positions", r.max_open_positions], ["max trades / day", r.max_trades_per_day], ["max daily loss", r.max_daily_loss]]) +
-    sec("Paper", [["fill mode", p.fill_mode], ["slippage (bps)", p.slippage_bps], ["next-quote timeout (s)", p.next_quote_timeout_seconds]]) +
-    sec("Live", [["product type", lv.product_type], ["order type", lv.order_type], ["limit offset (ticks)", lv.limit_price_offset_ticks], ["order poll (s)", lv.order_poll_seconds]]) +
+    sec("Paper", [["fill mode", p.fill_mode], ["slippage (bps per side)", p.slippage_bps], ["maximum quote age (s)", p.max_quote_age_seconds], ["quote fallback", p.quote_fallback], ["transaction cost per order", p.transaction_cost_per_order], ["transaction cost (bps)", p.transaction_cost_bps], ["indicative margin (%)", p.margin_estimate_pct_of_underlying_notional], ["report directory", p.report_dir]]) +
+    sec("Execution safety", [["live order placement", "hard-disabled until Phase 9"], ["live orders sent", "No"]]) +
     sec("System", [["version", st.version], ["trading mode", st.trading_mode], ["db path", sd.db_path]]);
 }
 
@@ -1131,10 +1147,10 @@ async function loadContract(force) {
 function ctrl(action, payload) {
   const token = prompt("Enter dashboard control token (empty if unset):") ?? "";
   if (action === "exit_all") {
-    const c = prompt("This closes ALL open positions at market.\nType EXIT ALL to confirm:");
-    if (c !== "EXIT ALL") return;
+    const c = prompt("This simulates a buy-to-close for ALL open paper positions using the latest usable quote or an explicitly labeled fallback.\nType PAPER EXIT ALL to confirm:");
+    if (c !== "PAPER EXIT ALL") return;
   }
-  if (action === "close_position" && !confirm("Close this position now (buy-to-close at market)?")) return;
+  if (action === "close_position" && !confirm("Simulate a paper buy-to-close using the latest usable quote?")) return;
   if (action === "rebuild_avwap" && !confirm("Schedule AVWAP rebuild for this contract?\n\nIt applies at the NEXT application start (the running engine is never modified live).")) return;
   fetch("/api/control", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(Object.assign({ action: action, token: token }, payload || {}))
@@ -1277,6 +1293,16 @@ def create_dashboard(app, control_token: str = "") -> Flask:
             return jsonify(app.pnl_history_payload())
         except Exception:
             log.exception("api/pnl_history failed")
+            raise
+
+    @flask.route("/api/paper-report")
+    def paper_report():
+        try:
+            return jsonify(app.paper_report_payload(request.args.get("date") or None))
+        except ValueError as exc:
+            return jsonify(ok=False, message=str(exc)), 400
+        except Exception:
+            log.exception("api/paper-report failed")
             raise
 
     @flask.route("/api/control", methods=["POST"])

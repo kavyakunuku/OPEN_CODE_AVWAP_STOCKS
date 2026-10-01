@@ -1,14 +1,7 @@
-"""Live broker: real Dhan orders. Same strategy engine as paper (spec §26).
+"""Dormant legacy live broker, hard-disabled for Phase 8.
 
-Order lifecycle (spec §27):
-    SIGNAL -> ORDER SENT -> (poll) ACCEPTED/FILLED / PARTIAL / REJECTED
-Position state is reconciled with Dhan; an order being sent is NEVER
-assumed to be filled.
-
-Duplicate protection (spec §28):
-    * one PENDING entry order per contract at a time
-    * one PENDING exit order per position at a time
-    * signals are already deduped upstream by (contract, candle, action)
+The Phase 8 app does not import this module and the broker constructor always
+raises. Live execution must wait for separate Phase 9 approval.
 """
 from __future__ import annotations
 
@@ -26,25 +19,11 @@ log = logging.getLogger("avwap.execution.live")
 class DhanBroker(Broker):
     mode = "LIVE"
 
-    def __init__(self, rest, orders: DhanOrders, db, positions, journal,
-                 product_type: str = "MARGIN", order_type: str = "MARKET",
-                 limit_offset_ticks: int = 1, tick_size: float = 0.05,
-                 confirm: str = "I_UNDERSTAND_LIVE_TRADING",
-                 live_confirmed: bool = False):
-        if not live_confirmed:
-            raise RuntimeError(
-                "Refusing to construct DhanBroker without live confirmation. "
-                "Set live.confirm_phrase in config AND pass --i-understand-live."
-            )
-        self.rest = rest
-        self.orders = orders
-        self.db = db
-        self.positions = positions
-        self.journal = journal
-        self.product_type = product_type
-        self.order_type = order_type
-        self.limit_offset_ticks = int(limit_offset_ticks)
-        self.tick_size = float(tick_size)
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "DhanBroker is hard-disabled in Phase 8. Live order placement is "
+            "unavailable until Phase 9 is separately approved."
+        )
 
     # -------------------------------------------------------------- helpers
     def _limit_price(self, ref: float, is_sell: bool) -> float:

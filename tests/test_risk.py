@@ -65,14 +65,26 @@ def test_max_daily_loss(tmp_path):
     assert "MAX_DAILY_LOSS(25000)" in r.entry_block_reasons(0, 0, -90000.0)
 
 
-def test_quantity_defaults_to_lot_size(tmp_path):
+def test_quantity_defaults_to_lot_size_and_rejects_invalid_explicit_sizes(tmp_path):
     r = _rm(tmp_path)
     c = OptionContract("S", "T 1500 CE", "T", 1500.0, "CE", "2026-09-29", 25)
-    assert r.quantity_for(c) == 25  # lot size
+    assert r.quantity_for(c) == 25  # contract lot size
     r2 = _rm(tmp_path, quantity_per_trade=75)
-    assert r2.quantity_for(c) == 75  # explicit config wins
+    assert r2.quantity_for(c) == 75  # explicit lot multiple wins
+    assert _rm(tmp_path, quantity_per_trade=26).quantity_for(c) == 0
+    assert _rm(tmp_path, quantity_per_trade=25.5).quantity_for(c) == 0
     c_nolot = OptionContract("S", "T 1500 CE", "T", 1500.0, "CE", "2026-09-29", 0)
     assert r.quantity_for(c_nolot) == 250  # fallback default
+
+
+def test_daily_pnl_is_unavailable_when_any_open_position_has_no_fresh_mark(tmp_path):
+    r = _rm(tmp_path)
+    pos = [{"security_id": "A", "entry_price": 100.0, "quantity": 25}]
+
+    assert r.daily_pnl("2026-09-15", pos, lambda security_id: None) is None
+    assert "UNPRICED_OPEN_POSITION_DRAWDOWN_GATE" in r.entry_block_reasons(
+        open_positions=1, trades_today=0, daily_pnl=None
+    )
 
 
 def test_daily_pnl_includes_unrealized(tmp_path):

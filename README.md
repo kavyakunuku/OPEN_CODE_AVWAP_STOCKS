@@ -1,19 +1,23 @@
 # AVWAP F&O Option-Selling System (Stock Options Only)
 
-A Python paper-trading (and later live-trading) system that implements **one
-strategy, exactly**:
+A Python **Phase 8 paper-trading-only** system that implements **one strategy,
+exactly**, against live Dhan market data:
 
 > **15-minute, contract-specific, lifetime-anchored AVWAP option-selling
 > for F&O stocks.**
 
-The strategy logic is **identical in PAPER and LIVE modes** — only the
-execution layer (and optionally the data source) changes.
+No live order-placement API is called. LIVE mode is hard-blocked by both the
+CLI and `TraderApp`; wait for Phase 9 and explicit approval before changing
+that restriction.
 
 ---
 
 ## 1. The strategy (as specified — do not "improve" it)
 
-For every F&O **stock** (not index options):
+For Dhan-backed Phase 6 operation, the configured Phase 1 stock universe is
+validated against the instrument master and passed through the opportunity
+scanner before contracts are monitored. With the scanner disabled, the legacy
+F&O **stock** (not index options) candidate behavior is:
 
 1. **Expiry** — the selected **monthly expiry**, identified from the actual
    exchange/Dhan expiry dates (the furthest expiry date of a calendar month):
@@ -21,10 +25,10 @@ For every F&O **stock** (not index options):
    * 24th → end of month: **next month's** monthly expiry
    * the 24th is a *premium-preservation* rule, not an expiry rule
 2. **ATM** — the available chain strike closest to the spot (ties → lower).
-3. **Universe** — for each underlying: `ATM + 4 ITM` calls **and** `ATM + 4
-   ITM` puts (max 10 contracts), from real chain strikes. The width `N` is
-   configurable via `strategy.itm_strikes_per_side` (default 4; deeper ITM
-   strikes have thin liquidity on most names).
+3. **Legacy candidates** — per underlying: `ATM + N ITM` calls **and**
+   `ATM + N ITM` puts, from real chain strikes; `N` is configurable via
+   `strategy.itm_strikes_per_side`. With the default Dhan scanner enabled,
+   Phase 2–5 further filters/ranks new candidates before AVWAP monitoring.
 4. **Candles** — completed **15-minute candles only** (NSE session
    09:15–15:30 IST). No intracandle signals, ever. The first possible
    signal is after 09:30.
@@ -50,6 +54,7 @@ avwap_trader/
 ├── main.py               # entry point (PAPER by default)
 ├── app.py                # orchestrator: feed → candles → AVWAP → signals → broker
 ├── config/config.json    # your configuration (start from config.example.json)
+├── config/universe.json  # Phase 1 validated 20-stock candidate universe
 ├── common/               # models, config loader, IST time/session math
 ├── dhan/
 │   ├── client.py         # Dhan v2 REST client + JWT (stdlib-only)
@@ -58,7 +63,7 @@ avwap_trader/
 │   ├── market_data.py    # intraday 15-min candles + batched quotes
 │   ├── liquidity.py      # adapt captured Dhan/project data for liquidity scoring
 │   ├── volatility.py     # adapt captured Dhan/project price/IV data
-│   ├── orders.py         # place order / order status / positions
+│   ├── orders.py         # dormant Dhan order adapter; not used in Phase 8
 │   └── feed.py           # DhanCandlePollFeed (real data) + MockFeed (dev only)
 ├── market/
 │   ├── candles.py        # 15-min candle engine (boundary/dedupe/no-intracandle)
@@ -73,8 +78,8 @@ avwap_trader/
 │   └── engine.py         # signal engine + duplicate-signal protection
 ├── execution/
 │   ├── broker.py         # broker interface (SIGNAL → ORDER → FILL)
-│   ├── paper.py          # PaperBroker (explicit fill conventions)
-│   └── live.py           # DhanBroker (real orders, fills, reconciliation)
+│   ├── paper.py          # quote-aware, persisted paper fills (no network access)
+│   └── live.py           # dormant legacy code; never imported by the Phase 8 app
 ├── portfolio/
 │   ├── positions.py      # position lifecycle (OPEN/CLOSED/PENDING/REJECTED)
 │   ├── pnl.py            # short P&L = (entry − exit) × qty
@@ -83,7 +88,7 @@ avwap_trader/
 │   ├── database.py       # SQLite: candles, avwap_state, signals, positions, orders, journal, kv
 │   └── journal.py        # permanent audit log
 ├── dashboard/            # Flask dashboard (status, scanner, positions, controls)
-└── tests/                # 163 tests covering strategy + Phases 2–5
+└── tests/                # full suite covers strategy + Phases 2–8
 ```
 
 ## Phase 2 — option contract discovery
@@ -290,114 +295,282 @@ configuration); `to_json()`, `to_csv(section)`, `write_json()`, and `write_csv()
 provide structured file/export paths. Phase 5 does not connect to order
 placement, AVWAP, entry/exit rules, or position management.
 
-## 3. Installation & running
+## Phase 6 — scanner-to-AVWAP integration
+
+For Dhan data, `opportunity.enabled` defaults to `true`. Phase 1 validates the
+20 configured stocks in `config/universe.json` against the same Dhan instrument
+master snapshot already loaded by the app. The runtime then uses the real option
+master, paced option-chain snapshots, current NSE_FNO/NSE_EQ quotes, and
+completed NSE_EQ 15-minute history to run the Phase 2 discovery, Phase 3 hard
+liquidity gate, Phase 4 volatility analysis, and Phase 5 ranking pipeline.
+Only top-ranked, metadata-registered contracts enter the scanner allow-list.
+Scanner failure or an empty ranking fails closed for new candidates. The mock
+feed has no genuine option-chain book/OI/IV source, so the scanner is disabled
+for mock mode instead of inventing inputs.
+
+```text
+20 validated stocks
+  → contract discovery + paced Dhan option-chain snapshots
+  → liquidity qualification (hard prerequisite) + timestamped volatility inputs
+  → deterministic opportunity ranking (default: top 10 contracts)
+  → history-prime newly selected option contracts
+  → existing completed-candle AVWAP evaluation
+  → existing AVWAP entry/exit + risk + PAPER execution
+
+open positions ────────────────────────────────────────┘ (always monitored)
+```
+
+The scanner only controls eligibility for **new** opportunities. It does not
+emit signals, change a position, switch a position to a higher-ranked contract,
+or decide SELL/EXIT. Open positions remain in the monitoring set even when
+rankings change or the scanner fails. Newly selected contracts are exposed only
+after their available option history has been merged into the existing AVWAP
+state; previously selected contracts that leave and re-enter the ranking keep
+their anchor and accumulated state. Only completed 15-minute candles are
+processed, using the existing candle boundaries and first-valid-signal timing.
+The AVWAP formula, anchoring, option-chart basis, entry/exit conditions, and
+mechanical exit logic are unchanged. Set `opportunity.enabled` to `false` to
+restore the legacy ATM/ITM candidate universe for Dhan.
+
+Each processed evaluation is idempotently stored in SQLite `evaluations` with
+evaluation timestamp, candle timestamp, symbol, option, liquidity score,
+volatility score, opportunity score, scanner timestamp, AVWAP, option close,
+and signal. Scanner scores are associated with the ranking used for the
+contract; active-position metrics retain their most recent scanner context.
+Dhan's current chain/quote observations are not historical archives: absent
+historical option quotes, depth, or IV are **not** fabricated. The runtime uses
+only the current chain's actual spread/depth/OI/IV fields and actual
+at-or-before-time option quotes; missing component history remains unavailable.
+Because the live pipeline does not yet archive option candles or book snapshots,
+history-based option-volume consistency, option movement, and historical IV
+remain unavailable (their configured component weights are not redistributed).
+
+Regression evidence:
 
 ```bash
-cd avwap_trader
-pip install -r requirements.txt
-
-# 1) paper trading on REAL Dhan market data (no orders sent)
-cp config/config.example.json config/config.json
-# edit config/config.json → dhan.client_id, dhan.access_token
-#    (or export DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN)
-python main.py
-# dashboard: http://localhost:9000
-
-# 2) development run with synthetic data (no Dhan account needed)
-python main.py --demo
-
-# 3) tests
-python -m pytest tests/ -v
+.venv/bin/pytest -q tests/test_avwap.py tests/test_avwap_gap_backfill.py \
+  tests/test_candles.py tests/test_engine.py tests/test_rules.py
+.venv/bin/pytest -q
 ```
+
+The integration tests compare Scanner OFF and ON for the same completed option
+candles and assert identical AVWAP state and signals; another test primes a
+newly selected contract and verifies the original first-valid completed-candle
+signal timing. `strategy/avwap.py` and the AVWAP formula are not changed by this
+integration. The complete regression suite passed 205 tests in the audited
+workspace on 2026-10-01, including paper execution, restart, scanner audit,
+reports, stale-mark handling, data validation, and live-order hard-block tests.
+Live order placement is rejected by the CLI, app constructor, legacy broker
+constructor, and legacy Dhan order adapter—not merely disabled in the example
+config.
+
+## Phase 8 — paper-only execution, audit, and recovery
+
+Phase 8 runs the validated 20-stock universe through contract discovery,
+liquidity qualification, volatility analysis, opportunity ranking, and the
+existing option-candle AVWAP strategy. Dhan scanner snapshots refresh at the
+configured `opportunity.refresh_minutes` cadence (15 minutes by default), and
+each scan run plus each discovered contract's qualified/rejected/selected
+status is persisted before the next re-rank can replace the in-memory ranking.
+Re-ranking controls new entries only: it never replaces or closes an active
+position. Active contracts remain monitored until the unchanged AVWAP/mechanical
+exit or an explicit paper-only manual close.
+
+Paper execution is quote-aware and deliberately avoids midpoint fills:
+
+* A fresh two-sided Dhan option book (at most `paper.max_quote_age_seconds`
+  old) is crossed: entry SELL at the captured best bid; exit BUY at the captured
+  best ask.
+* Configured adverse slippage is applied per side and rounded against the
+  paper trader to the contract tick. Defaults are 5 basis points per side and
+  a 60-second maximum quote age.
+* If a fresh two-sided book is unavailable, strategy fills fall back to the
+  AVWAP signal candle close plus adverse slippage. Each event records the
+  method, quote timestamp/age, any observed bid/ask/spread, signal and fill
+  timestamps/prices, quantity, lot size, slippage, configured costs, AVWAP,
+  underlying spot, and indicative margin. Missing bid/ask is left missing; it
+  is never synthesized. Manual exits may use a fresh timestamped LTP only when
+  no valid two-sided book exists and are labeled as an explicit LTP fallback.
+* Transaction-cost defaults are zero; only configured per-order and premium-
+  turnover bps are reported, rather than silently inventing taxes/fees. The
+  default margin estimate is 20% of underlying notional and is indicative,
+  not a Dhan/SPAN requirement. Daily output distinguishes gross P&L from net
+  P&L after configured costs.
+
+SQLite stores immutable-ish paper fill events, scanner runs and per-contract
+decisions, timestamped position marks, errors, and daily report summaries.
+Open positions, closed positions, entry/exit details, P&L, margin estimate,
+contract, quantity, and AVWAP survive restart. On startup, incomplete audit
+rows are reconstructed from persisted positions with missing quote fields kept
+NULL and explicitly labeled as recovered; a restart never fabricates market
+data or replaces an active position. Runtime errors and recovery actions are
+written to the paper error table and journal.
+
+Reports are regenerated during operation (on scans/signals, periodically, and
+at shutdown) and can be rebuilt without starting the engine:
+
+```bash
+python -m paper_trading report                  # all stored days plus today
+python -m paper_trading report --date 2026-09-30 # one day
+```
+
+Each `reports/paper/YYYY-MM-DD/` contains `daily.json`, `daily.md`, scanner,
+trade, position, execution, and error CSVs. Root-level `trade_log.csv`,
+`position_log.csv`, `paper_error_log.csv`, and `daily_index.csv` provide
+multi-day exports. The dashboard shows scanner/report status and serves a
+read-only summary at `/api/paper-report?date=YYYY-MM-DD`.
+
+**LIVE is hard-disabled for Phase 8.** `python main.py --mode LIVE`, a LIVE
+config value, or `TRADING_MODE=LIVE` exits before a broker/app is constructed;
+`TraderApp` also rejects non-PAPER mode. The `DhanOrders` and `DhanBroker`
+legacy modules are not imported or instantiated by the app. No live order,
+position reconciliation, or order-poll endpoint is called. `--i-understand-live`
+is a legacy compatibility flag only and cannot enable orders. Phase 9 remains
+out of scope until separately approved.
+
+## 3. Installation & running
+
+Create a virtual environment from the repository root, then install the
+project requirements. Python 3.10+ is required (Python 3.11 is recommended).
+
+Linux/macOS:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp config/config.example.json config/config.json
+```
+
+Windows PowerShell:
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Copy-Item config/config.example.json config/config.json
+```
+
+`config/config.json` is a local, Git-ignored file. For Dhan-backed paper mode,
+set `dhan.client_id` and `dhan.access_token` there, or use the environment
+variables `DHAN_CLIENT_ID` and `DHAN_ACCESS_TOKEN` instead. Keep credentials
+private; do not commit them or paste them into an issue or chat. For a local-only
+dashboard, set `dashboard.host` to `127.0.0.1` in your local config and use a
+strong `dashboard.control_token` if remote control is enabled.
+
+From the repository root, with the virtual environment active:
+```bash
+# Full regression suite
+python -m pytest -q
+
+# Dhan-backed PAPER mode: real market data, virtual fills only, NO live orders
+python main.py
+# dashboard (default port): http://127.0.0.1:9000
+
+# Optional development smoke run: synthetic data; no Dhan credentials needed
+python main.py --demo
+```
+
+The `--demo` run is not a market-data integration test or evidence of strategy
+performance. Phase 8 is paper-only: the CLI rejects LIVE mode and the application
+does not send live order-placement requests. The scanner cannot automatically
+replace active positions. The Phase 7 historical archive is not bundled; until
+the required archived market data is supplied, empirical backtest results are
+blocked and must not be inferred from synthetic data.
 
 ### What happens on startup
 
 ```
 load config + database
-  → load open positions + AVWAP states            (restart recovery)
-  → load Dhan instrument masters (cached 12 h)
-  → F&O stock universe (derived, not hard-coded)
-  → optionally restricted to market_data.universe_stocks (curated liquid list)
-  → per underlying: expiry list → selected legs → option chain per leg
-      (monthly single leg for all stocks; paced at 1 request / 3 s —
-       ≈ 8 min for the 67-stock curated list, ≈ 25 min for the full ~210)
-  → ATM + 4 ITM × (CE+PE) per expiry leg (default width; strategy.itm_strikes_per_side)
-  → per contract: fetch month-to-date 15-min candles → AVWAP init
+  → load open positions + AVWAP states               (restart recovery)
+  → load Dhan instrument-master snapshot (cached 12 h)
+  → if opportunity.enabled + Dhan: validate config/universe.json symbols
+      against that same snapshot; fetch timestamped NSE_EQ 15-minute history
+      and paced monthly option-chain snapshots for the validated universe
+      → Phase 2 discovery → Phase 3 liquidity gate → Phase 4 volatility
+      → Phase 5 ranking → new-entry eligibility allow-list (top opportunities)
+    else: legacy F&O/ATM-ITM candidate selection
+  → register selected option metadata; AVWAP-monitor eligible contracts ∪ positions
+  → prime/restore completed option candles and AVWAP state
   → engine loop:
       candle window closes → fetch completed candle → AVWAP update
-      → rules → signal → risk gate → PAPER fill | Dhan order
-      → quote polling for LTP/dashboard
-      → (LIVE) order-status polling + position reconciliation
-  → dashboard
+      → existing rules → signal → risk gate → PAPER fill (example config)
+      → Dhan quote polling for fills/marks/dashboard
+      → SQLite paper audit + daily/multi-day report refresh
+  → dashboard (paper-only; no order endpoint calls)
 ```
 
 ## 4. Configuration reference
 
 | Key | Default | Meaning |
 |---|---|---|
-| `trading_mode` | `PAPER` | `PAPER` or `LIVE`. Never silent-falls back. |
+| `trading_mode` | `PAPER` | Phase 8 accepts `PAPER` only. `LIVE` is rejected by CLI and app before broker construction. |
 | `dhan.client_id` / `dhan.access_token` | — | Dhan API credentials (also `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` env vars) |
 | `market_data.mode` | `candle_poll` | default data path: authoritative completed candles from Dhan's intraday API + batched LTP quotes |
 | `market_data.source` | `dhan` | `dhan` (real) or `mock` (synthetic, development only) |
 | `market_data.boundary_grace_seconds` | `8` | wait after a boundary before fetching the fresh candle |
 | `market_data.ltp_poll_seconds` | `30` | dashboard LTP refresh cadence |
 | `market_data.history_start` | `month_start` | AVWAP init window (fallback `history_lookback_days_fallback`) |
-| `market_data.universe_refresh_minutes` | `60` | how often the option chains / ATM are refreshed |
-| `market_data.universe_stocks` | `[]` (all F&O stocks) | optional curated list of liquid stocks to trade (e.g. 67 high-volume names, shipped in `config/config.json`). Symbols are matched against the live Dhan master case-insensitively; names not in the master are logged and skipped. `[]` = full universe |
-| `strategy.itm_strikes_per_side` | `4` | ATM + N in-the-money strikes per side (CE below ATM, PE above ATM). Default 4 — deeper ITM strikes have thin liquidity/OI on most names. Open positions are always monitored even when they fall outside this width |
+| `market_data.universe_refresh_minutes` | `60` | option-chain refresh cadence; with the scanner enabled, the effective cadence is the shorter of this and `opportunity.refresh_minutes` |
+| `market_data.universe_stocks` | `[]` | optional additional allow-list matched against the live Dhan master. With the scanner enabled, the base universe is the validated symbol list in `config/universe.json`; an explicit non-empty value intersects that list. With the scanner disabled, `[]` retains the legacy full F&O universe |
+| `strategy.itm_strikes_per_side` | `6` | ATM + N in-the-money strikes per side (CE below ATM, PE above ATM). Open positions are always monitored even when they fall outside this width |
 | `strategy.expiry_switch_day` | `24` | premium-preservation switch day |
+| `opportunity.enabled` | `true` (Dhan only) | Phase 2–5 scanner eligibility filter; `false` restores the legacy ATM/ITM candidate set; mock mode disables it because no real option-chain book is available |
+| `opportunity.refresh_minutes` | `15` | scanner re-ranking cadence; active positions remain monitored regardless |
+| `opportunity.underlying_history_days` | `90` | lookback requested for Phase 4 NSE_EQ 15-minute bars (only completed bars are scored) |
 | `opportunity.weights` | `0.40 / 0.30 / 0.20 / 0.10` | liquidity / volatility / chain quality / execution quality scanner weights |
 | `opportunity.selection` | `10 / 14 / 10` | max stocks / contracts per stock / top opportunities |
 | `opportunity.execution` | spread `0.30–0.50%`, quote age `60s` | execution-quality spread and freshness normalization (not fill/slippage prediction) |
-| `paper.fill_mode` | `candle_close` | `candle_close` (fill = signal candle close) or `next_quote` (first LTP after the close, fallback candle close) |
-| `paper.slippage_bps` | `0` | optional slippage applied against the trader |
-| `live.product_type` | `MARGIN` | Dhan product type for orders |
-| `live.order_type` | `MARKET` | `MARKET` or `LIMIT` (`limit_price_offset_ticks`) |
+| `paper.fill_mode` | `marketable_quote` | Required by the persistent app: crosses fresh top of book (SELL at bid, BUY at ask). Non-marketable diagnostic modes are rejected by `TraderApp`. |
+| `paper.slippage_bps` | `5` | adverse slippage per side, rounded against the trader to contract tick |
+| `paper.max_quote_age_seconds` | `60` | maximum age for quote-based fills/marks; a missing/stale book is labeled and uses the documented signal-close fallback |
+| `paper.quote_fallback` | `signal_candle_close` | explicit fallback for strategy fills when no fresh two-sided book exists |
+| `paper.transaction_cost_per_order` / `transaction_cost_bps` | `0` / `0` | optional paper cost assumptions; no exchange/tax fees are invented |
+| `paper.margin_estimate_pct_of_underlying_notional` | `20` | indicative estimate only, not official Dhan/SPAN margin |
+| `paper.report_dir` | `reports/paper` | daily JSON/Markdown/CSV plus multi-day position/trade/error logs |
+| `paper.report_refresh_seconds` | `300` | periodic report refresh in addition to scan/signal/shutdown updates |
+| `paper.exit_retry_seconds` | `30` | retry interval for an unfilled 15:15 paper mechanical exit while the session remains open |
 | `risk.quantity_per_trade` | `null` | `null` = use the contract's lot size from the instrument master |
 | `risk.max_open_positions` | `8` | entry gate |
 | `risk.max_trades_per_day` | `20` | entry gate |
 | `risk.max_daily_loss` | `25000` | entry gate (realized today + unrealized at LTP) |
 | `dashboard.*` | `:9000` | dashboard host/port; `control_token` guards the control buttons |
 
-## 5. Paper fill convention (explicit, per spec)
+## 5. Paper fill convention and audit
 
-| Mode | Entry SELL | Exit BUY |
-|---|---|---|
-| `fill_mode=candle_close` (default) | close of the completed signal candle | close of the completed signal candle |
-| `fill_mode=next_quote` | first LTP quote after the close (≤ `next_quote_timeout_seconds`, else candle close) | same |
+The default app setting is `paper.fill_mode=marketable_quote`. For each entry
+SELL, a fresh timestamped Dhan two-sided book is crossed at its best bid; for
+each exit BUY, it is crossed at its best ask. No midpoint fill is assumed.
+Configured adverse slippage (5 bps per side by default) is then applied and
+tick-rounded against the trader. The quote freshness limit is 60 seconds by
+default.
 
-Signal price, fill price, AVWAP at entry/exit, and the reason are all
-recorded separately in the journal and positions table.
+If a strategy fill has no valid fresh two-sided book, it uses the signal
+candle's close plus adverse slippage and records
+`SIGNAL_CANDLE_CLOSE_FALLBACK_NO_FRESH_BOOK`; stale observed bid/ask and quote
+age remain recorded when available. Manual paper exits may use a fresh real LTP
+when a two-sided book is absent, and are labeled as an explicit LTP fallback.
+Missing quotes are never invented. Optional configured transaction costs are
+reported separately: the underlying position P&L stays gross, while daily
+reports also provide net P&L after configured costs. The margin field is an
+indicative configurable percentage of underlying notional, not official margin.
 
-## 6. Live trading (LIVE mode) — checklist
+Each `paper_execution_events` row stores signal/fill prices and timestamps,
+bid, ask, spread, quote timestamp/age, execution method, slippage, quantity,
+lot size, AVWAP, configured transaction cost, underlying spot, and indicative
+margin. The journal, `orders` table (paper-virtual rows only), and position
+records retain the execution lifecycle. `python -m paper_trading report` can
+regenerate all daily reports and multi-day CSV logs after restart.
 
-LIVE mode requires **two explicit confirmations**: `trading_mode: "LIVE"` in
-the config **and** the `--i-understand-live` flag (or
-`AVWAP_LIVE_CONFIRM=I_UNDERSTAND_LIVE_TRADING`). Otherwise the app aborts and
-prints the checklist:
+## 6. LIVE trading is disabled in Phase 8
 
-1. Dhan credentials confirmed (client_id, access token).
-2. Static-IP / API-plan requirements satisfied for your account.
-3. Instrument mapping verified (security IDs, lot sizes from the master).
-4. Lot size per trade verified (`risk.quantity_per_trade` vs master).
-5. Monthly expiry selection verified (24th switch rule, real expiry dates).
-6. ATM calculation verified against the chain.
-7. AVWAP calculation verified (`pytest` + several paper days).
-8. Signal detection verified (one cross → one order; duplicates suppressed).
-9. Paper execution observed for a sufficient number of days.
-10. Position reconciliation verified (restart the app with open positions).
-11. Order status handling verified (partial fills, rejections — exits that
-    get rejected stay OPEN and raise a loud journal error).
-12. Emergency exit tested (`EXIT ALL POSITIONS` on the dashboard).
-
-When LIVE is active the dashboard shows a pulsing red banner:
-`⚠ LIVE TRADING ENABLED — REAL ORDERS MAY BE SENT TO DHAN`.
-
-Live order lifecycle: `SIGNAL → ORDER SENT → (poll) COMPLETE / PARTIAL /
-REJECTED`. Positions are `PENDING` until Dhan reports the fill; fills use
-Dhan's `avgPrice`. On every start the system reconciles DB positions against
-`GET /v2/positions` (foreign shorts are adopted into monitoring with a loud
-warning; missing shorts are marked `CLOSED/RECONCILED_NOT_FOUND`).
+There is no LIVE option in this phase. Setting `trading_mode=LIVE`, exporting
+`TRADING_MODE=LIVE`, or passing `--mode LIVE` to `main.py` exits with an error
+before broker construction. `TraderApp` independently raises on any
+non-PAPER mode. The legacy `--i-understand-live` flag is ignored; it cannot
+unlock orders. The app does not import or instantiate `DhanBroker`/`DhanOrders`,
+does not call order placement, does not poll live order status, and does not
+reconcile brokerage positions. Wait for Phase 9 and explicit authorization.
 
 ## 7. Data & storage
 
@@ -407,24 +580,29 @@ SQLite (`data/trader.db`, WAL mode). Tables:
 * `avwap_state` — **the** cumulative AVWAP state per contract (restart-proof)
 * `signals` — every signal, unique key `(contract, candle, action)`
 * `positions` — full trade records incl. entry/exit AVWAP, reasons, P&L
-* `orders` — every order (paper-virtual + live) with raw responses
-* `journal` — permanent audit trail (SIGNAL, PAPER_ENTRY, ORDER_SENT, FILL,
-  ORDER_REJECTED, ENTRY_BLOCKED, RECONCILE, …)
-* `kv` — persisted risk flags (emergency stop, disable entries)
+* `orders` — paper-virtual order lifecycle only; no Dhan order requests
+* `paper_execution_events` — quote/fill audit and execution assumptions
+* `paper_scanner_runs`, `paper_scanner_candidates` — timestamped scan decisions
+* `paper_position_marks` — timestamped quote marks and unrealized P&L
+* `paper_errors`, `paper_daily_reports` — recovery/error log and report index
+* `journal` — permanent audit trail (SIGNAL, PAPER_ENTRY, PAPER_EXIT,
+  ENTRY_BLOCKED, PAPER_ERROR, recovery events, …)
+* `kv` — risk flags, startup state, and paper-session restart heartbeat
 
-Restart recovery: load DB → load open positions (adopt contracts that are no
-longer in the scanner) → load AVWAP states → reconcile (LIVE) → resume.
+Restart recovery: load DB → restore open paper positions (adopt contracts that
+left the scanner) → reconstruct incomplete fill-audit rows without inventing
+quotes → load AVWAP states → resume. Re-ranking never replaces an open position.
 Already-consumed candles are never re-evaluated (three layers: in-memory
 candle dedupe, persisted signal keys, AVWAP-state idempotency).
 
 ## 8. Risk controls (separate from the strategy)
 
-The strategy engine only sees AVWAP crosses. Before a signal becomes an order,
-the risk gate may block it: max open positions, max trades/day, max daily
-loss, `disable_new_entries` (dashboard switch), `emergency_stop` (dashboard
-button — blocks new entries; **exits always work**). `EXIT ALL POSITIONS` is
-an operational override, recorded as `MANUAL_EXIT_ALL`, and is not part of
-the strategy logic.
+The strategy engine only sees AVWAP crosses. Before a signal becomes a paper
+fill, the risk gate may block it: max open positions, max trades/day, max daily
+loss, `disable_new_entries` (dashboard switch), or `emergency_stop` (dashboard
+button — blocks new entries; **exits always work**). `PAPER EXIT ALL` is an
+operational paper-only override recorded in the journal; it is not part of the
+strategy logic and cannot send a live order.
 
 ## 9. Dashboard (display + operational controls)
 
@@ -466,8 +644,11 @@ candles independently; the dashboard never influences trading.
 ## 10. Testing
 
 ```
-python -m pytest tests/ -v     # 163 tests
+python -m pytest -q
 ```
+
+The audited workspace's full suite passed 205 tests on 2026-10-01; run the
+command above after installing dependencies to verify your local checkout.
 
 Coverage per the specification's testing requirements:
 
@@ -500,6 +681,10 @@ Coverage per the specification's testing requirements:
   execution spread/freshness scoring, deterministic ranks/tie-breaks, top-N caps,
   independent CE/PE qualification, existing-position underlying exclusion,
   historical as-of integrity, end-to-end Phase 2/3/4 inputs, and JSON/CSV output
+* Phase 6 integration: Scanner OFF/ON AVWAP equivalence for identical candles,
+  option-history priming and first-valid completed-candle timing, fail-closed
+  eligibility/position union, Phase 1 master-snapshot reuse, Dhan NSE_EQ history
+  payload, quote-book parsing/rate pacing, and evaluation-record persistence
 * Multi-expiry legs: N consecutive weekly selection (current+next week,
   rolling forward), per-leg ATM from each leg's own strikes, `drop_expiries`
   removes rolled-off legs while keeping positions monitored, one dashboard
@@ -526,17 +711,20 @@ Coverage per the specification's testing requirements:
   closing-auction candle is outside the 09:15–15:30 session and is dropped.
 * Quotes: Market Quote API `POST /v2/marketfeed/quote` (body
   `{"NSE_FNO":[ids]}` / `{"NSE_EQ":[ids]}`) — up to 1000 ids per request,
-  1 request/s; LTP + day volume per instrument. 429s are retried.
-* Orders: `POST /v2/oddl/requests/order`, status via
-  `GET /v2/oddl/requests/order/get/{id}`, positions via `GET /v2/positions`
-  (raw bodies are logged on every order response).
+  shared 1 request/s pacing; LTP, day volume, F&O OI, and supplied market depth
+  are timestamped on receipt. Depth/book fields are used only as current data.
+* Order-placement endpoints are not used or called by the Phase 8 app. The
+  legacy Dhan order adapter exists only as dormant code for a separately
+  approved later phase.
 * Instrument master: `https://images.dhan.co/api-data/api-scrip-master-detailed.csv`
   (the old `…/api/instruments/v2/…/option-instrument-master.csv` URLs are
   dead — they 403 for everyone). Cached under `data/instruments/` (12 h TTL);
   the F&O stock universe is **derived** from it (index/ETF underlyings
   excluded), lot sizes and tick sizes included.
-* A full real-data bootstrap walks ~210 stocks through the 3 s-paced chain
-  API, so **start the app ~30 minutes before the 09:15 open**.
+* With the default scanner, real-data bootstrap scans the 20 Phase 1 stocks
+  in `config/universe.json`; starting before market open allows time for the
+  3 s-paced expiry/chain requests and AVWAP history. Disabling the scanner
+  restores the legacy full F&O universe and its longer bootstrap.
 * All API errors are logged with raw response bodies and are isolated per
   instrument — one bad stock never stops the rest.
 
@@ -560,8 +748,9 @@ or market hours. **Never use mock data to validate the strategy.**
 * The Dhan quotes/chain endpoints used here were verified against the v2
   docs in 2026-09; if Dhan changes a field name, the parsers log the raw
   response so it's easy to spot.
-* Transaction costs (brokerage/STT/charges) are intentionally NOT part of
-  P&L yet — add them as a separate configuration in a future revision.
+* Transaction costs default to zero and remain configurable paper assumptions;
+  brokerage/taxes are not silently inferred. Compare the report's gross and
+  configured net P&L fields accordingly.
 * The dashboard is a development-grade Flask server (fine for a single
   trader's machine; put it behind a reverse proxy if exposed).
 

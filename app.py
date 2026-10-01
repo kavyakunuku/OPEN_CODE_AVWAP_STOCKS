@@ -1,25 +1,23 @@
 """TraderApp: the orchestrator.
 
-Data flow (spec §1):
+Phase 8 is paper-only:
 
-    Dhan market data  ->  Market Data Engine (feed)
-                       ->  15-min Candle Engine
-                       ->  Option Contract Management (universe)
-                       ->  AVWAP Calculation Engine
-                       ->  Strategy / Signal Engine
-                       ->  PAPER execution  |  LIVE execution
-                       ->  Positions / P&L / Journal / Dashboard
+    Dhan market data  ->  20-stock scanner -> 15-min candles / AVWAP
+                       ->  unchanged strategy signals -> PAPER execution
+                       ->  Positions / P&L / Journal / Dashboard / reports
 
-The strategy logic is IDENTICAL in both modes; only the broker and data
-source change.
+This application deliberately refuses LIVE mode and contains no order-placement
+path. Do not enable LIVE trading until a separately approved phase.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
+import uuid
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Optional
 
@@ -51,12 +49,13 @@ from dhan.instruments import (
 )
 from dhan.market_data import DhanMarketData
 from dhan.option_chain import PacedChainClient
-from dhan.orders import DhanOrders
 from execution.broker import Broker
-from execution.live import DhanBroker
 from execution.paper import PaperBroker
+from paper_trading.reports import PaperReportWriter
 from market.candles import CandleEngine, last_closed_window_start
+from market.opportunity_runtime import OpportunityScanPipeline
 from market.universe import UniverseManager, select_monthly_expiry
+from market.universe_manager import UniverseManager as StockUniverseManager
 from portfolio.positions import PositionManager
 from portfolio.risk import RiskManager
 from storage.database import Database
@@ -145,7 +144,17 @@ def filter_configured_universe(underlyings: list[str], allowed: list[str]) -> tu
 class TraderApp:
     def __init__(self, cfg: dict, live_confirmed: bool = False):
         self.cfg = cfg
-        self.mode = cfg["trading_mode"]
+        self.mode = str(cfg_get(cfg, "trading_mode", "PAPER")).upper()
+        if self.mode != "PAPER":
+            raise RuntimeError(
+                "LIVE trading is hard-disabled in Phase 8. Set trading_mode=PAPER; "
+                "no live order-placement API is available in this application."
+            )
+        if str(cfg_get(cfg, "paper.fill_mode", "marketable_quote")) != "marketable_quote":
+            raise ValueError(
+                "The Phase 8 app requires paper.fill_mode=marketable_quote; "
+                "non-marketable diagnostic fills are not enabled in the persistent app"
+            )
         self.loop_tick = float(cfg_get(cfg, "market_data.loop_tick_seconds", 1.0))
         self.interval = int(cfg_get(cfg, "strategy.candle_interval_minutes", 15))
         self.boundary_grace = float(cfg_get(cfg, "market_data.boundary_grace_seconds", 8))
@@ -157,13 +166,41 @@ class TraderApp:
         self.positions = PositionManager(self.db)
         self.avwap = AvwapStore(self.db)
         self.risk = RiskManager(self.db, cfg)
+        self.paper_session_id = uuid.uuid4().hex
+        self.paper_report_dir = cfg_get(cfg, "paper.report_dir", "reports/paper")
+        self.paper_report_writer = PaperReportWriter(
+            self.db, self.paper_report_dir, cfg_get(cfg, "paper", {})
+        )
+        self._paper_current_day: Optional[str] = None
+        self._last_paper_heartbeat = 0.0
+        self._last_paper_report_at = 0.0
 
         # ---- feed + clock + broker
         source = cfg_get(cfg, "market_data.source", "dhan")
         self.source = source
+        scanner_requested = bool(cfg_get(cfg, "opportunity.enabled", True))
+        # MockFeed deliberately has no option-chain book, OI or IV source. Do
+        # not fabricate scanner data for it; the legacy mock AVWAP demo remains
+        # available and the Dhan-backed scanner is active only on Dhan data.
+        self.opportunity_enabled = scanner_requested and source == "dhan"
+        self.opportunity_status = (
+            "disabled_mock_source" if scanner_requested and source != "dhan"
+            else "starting" if self.opportunity_enabled else "disabled"
+        )
+        self.opportunity_error: Optional[str] = None
+        self.opportunity_result = None
+        self._opportunity_service: Optional[OpportunityScanPipeline] = None
+        self._opportunity_symbols: list[str] = []
+        self._scanner_history_by_symbol: dict[str, list] = {}
+        self._chain_snapshots: dict = {}
+        self._chain_snapshot_lock = threading.RLock()
+        self._opportunity_scores: dict[str, dict] = {}
+        self._opportunity_lock = threading.RLock()
+        self._bootstrap_complete = False
+        if scanner_requested and source != "dhan":
+            log.info("Opportunity scanner disabled for %s source: no timestamped option-chain book is available", source)
         self.rest = None
         self.md = None
-        self.orders_api = None
         self.chain_client: Optional[PacedChainClient] = None
         self.underlying_ids: dict[str, str] = {}
         self.tick_sizes: dict[str, float] = {}
@@ -188,10 +225,9 @@ class TraderApp:
                 quote_batch_size=int(cfg_get(cfg, "market_data.quote_batch_size", 1000)),
             )
             self.feed = DhanCandlePollFeed(self.md, rest, cfg)
-            self.orders_api = DhanOrders(rest)
             self.chain_client = PacedChainClient(rest)
 
-        self.broker: Broker = self._make_broker(live_confirmed)
+        self.broker: Broker = self._make_broker()
 
         # ---- market / strategy
         self.candles = CandleEngine(self.interval)
@@ -207,9 +243,12 @@ class TraderApp:
         # ---- runtime state
         self.ltp: dict[str, float] = {}
         self._ltp_lock = threading.Lock()
+        # Only real marketfeed/quote observations are eligible for quote-aware
+        # fills. Cached LTP values are never treated as bid/ask or synthesized.
+        self._option_quote_cache: dict[str, object] = {}
+        self._underlying_quote_cache: dict[str, object] = {}
+        self._quote_cache_lock = threading.RLock()
         self._processed: dict[str, int] = {}      # sec_id -> last processed window start
-        self._pending_fills: list[dict] = []      # paper next_quote fills awaiting LTP
-        self._pending_fill_lock = threading.Lock()
         self.started_at = int(time.time())
         self.last_update_ts = 0
         self.last_error: Optional[str] = None
@@ -239,29 +278,31 @@ class TraderApp:
     def now(self) -> datetime:
         return self.feed.now()
 
-    def _make_broker(self, live_confirmed: bool) -> Broker:
-        if self.mode == "PAPER":
-            return PaperBroker(
-                self.db,
-                self.positions,
-                self.journal,
-                fill_mode=cfg_get(self.cfg, "paper.fill_mode", "candle_close"),
-                slippage_bps=float(cfg_get(self.cfg, "paper.slippage_bps", 0)),
-            )
-        # LIVE
-        if self.rest is None:
-            raise RuntimeError("LIVE mode requires Dhan credentials")
-        return DhanBroker(
-            self.rest,
-            self.orders_api,
+    def _make_broker(self, live_confirmed: bool = False) -> Broker:
+        # Defense in depth: a caller cannot turn a PAPER app instance into a
+        # live broker by changing mode after construction or passing a flag.
+        if self.mode != "PAPER":
+            raise RuntimeError("Only the Phase 8 PAPER broker is supported")
+        broker = PaperBroker(
             self.db,
             self.positions,
             self.journal,
-            product_type=cfg_get(self.cfg, "live.product_type", "MARGIN"),
-            order_type=cfg_get(self.cfg, "live.order_type", "MARKET"),
-            limit_offset_ticks=int(cfg_get(self.cfg, "live.limit_price_offset_ticks", 1)),
-            live_confirmed=live_confirmed,
+            fill_mode=cfg_get(self.cfg, "paper.fill_mode", "marketable_quote"),
+            slippage_bps=float(cfg_get(self.cfg, "paper.slippage_bps", 5)),
+            max_quote_age_seconds=float(cfg_get(self.cfg, "paper.max_quote_age_seconds", 60)),
+            quote_fallback=str(cfg_get(self.cfg, "paper.quote_fallback", "signal_candle_close")),
+            transaction_cost_per_order=float(cfg_get(self.cfg, "paper.transaction_cost_per_order", 0)),
+            transaction_cost_bps=float(cfg_get(self.cfg, "paper.transaction_cost_bps", 0)),
+            margin_estimate_pct=float(cfg_get(
+                self.cfg, "paper.margin_estimate_pct_of_underlying_notional", 20
+            )),
         )
+        if broker.fill_mode != "marketable_quote":
+            raise ValueError(
+                "The Phase 8 app requires paper.fill_mode=marketable_quote; "
+                "non-marketable diagnostic fills are not enabled in the persistent app"
+            )
+        return broker
 
     # ------------------------------------------------------------- bootstrap
     def _startup(self, phase: str, detail: str, progress: int = 0, total: int = 0) -> None:
@@ -331,6 +372,12 @@ class TraderApp:
         self._startup("bootstrapping", "building AVWAP history")
         self._init_avwap_for_monitored()
         self._seed_processed_from_db()
+        self._bootstrap_complete = True
+        if self.source == "dhan":
+            # Bootstrap already fetched the option chains and ran the initial
+            # ranking; do not immediately repeat the same rate-limited refresh
+            # on the first main-loop tick.
+            self._last_universe_refresh = time.time()
         # V2: persist the completed startup timeline (Recovery Center shows
         # the LAST startup even after a restart, before the new one finishes)
         try:
@@ -418,6 +465,42 @@ class TraderApp:
                     log.warning(
                         "universe_stocks: not in live F&O master, skipped: %s", skipped
                     )
+
+        if self.opportunity_enabled:
+            try:
+                phase1 = StockUniverseManager(cfg=self.cfg, rest=self.rest)
+                phase1.initialize_from_master_bundle(bundle, captured_at=self.now())
+                phase1_symbols = phase1.get_enabled_symbols()
+                # market_data.universe_stocks remains an optional additional
+                # allow-list; the validated Phase 1 list is the scanner's base.
+                if configured:
+                    configured_set = {str(value).strip().upper() for value in configured
+                                       if str(value).strip()}
+                    phase1_symbols = [symbol for symbol in phase1_symbols
+                                      if symbol.upper() in configured_set]
+                self._opportunity_symbols = list(phase1_symbols)
+                self._opportunity_service = OpportunityScanPipeline(
+                    self.cfg,
+                    market_data=self.md,
+                    master_contracts=self.master_contracts,
+                    validated_symbols=self._opportunity_symbols,
+                    underlying_ids=self.underlying_ids,
+                    master_snapshot_at=phase1.master_loaded_at,
+                    now_fn=self.now,
+                )
+                # Scanner ON: only Phase 1's validated 20-stock universe enters
+                # contract discovery. Open positions are still unioned later.
+                underlyings = list(self._opportunity_symbols)
+                self.opportunity_status = "collecting_inputs"
+                log.info("Opportunity scanner universe: %d validated stocks", len(underlyings))
+            except Exception as exc:
+                self._opportunity_service = None
+                self._opportunity_symbols = []
+                self.opportunity_status = "error"
+                self.opportunity_error = f"{exc.__class__.__name__}: {exc}"
+                log.exception("Opportunity scanner initialization failed; new entries fail closed")
+                underlyings = []
+
         log.info("F&O stock universe: %d stocks", len(underlyings))
 
         today = self.now().date()
@@ -428,6 +511,12 @@ class TraderApp:
             master_index.setdefault((c.underlying, c.expiry), {})[
                 (c.strike, c.option_type)
             ] = c
+
+        if self._opportunity_service is not None and self._opportunity_symbols:
+            self._scanner_history_by_symbol = self._opportunity_service.fetch_underlying_bars(
+                symbols=self._opportunity_symbols,
+                as_of=self.now(),
+            )
 
         ok = 0
         for i, u in enumerate(underlyings, 1):
@@ -456,7 +545,14 @@ class TraderApp:
             if i % 20 == 0 or i == len(underlyings):
                 log.info("Bootstrap progress: %d/%d underlyings", i, len(underlyings))
         if ok == 0:
+            if self.opportunity_enabled:
+                log.error("No scanner underlyings could be bootstrapped; keeping new entries fail-closed")
+                self._run_opportunity_scan()
+                return
             raise RuntimeError("Bootstrap failed for all underlyings; aborting")
+
+        if self.opportunity_enabled:
+            self._run_opportunity_scan()
 
     def _expiry_legs_for(
         self, u: str, today: date, switch_day: int, expiries: list[date]
@@ -496,6 +592,8 @@ class TraderApp:
                 self._touch_feed("chain", False, err=str(e))
                 raise
             self._touch_feed("chain", True, (time.perf_counter() - _t0) * 1000)
+            with self._chain_snapshot_lock:
+                self._chain_snapshots[u.upper()] = chain
             if chain.spot is None:
                 log.warning("Option chain for %s %s has no spot; skipping leg", u, expiry)
                 continue
@@ -705,34 +803,167 @@ class TraderApp:
             self._processed[sec] = last
 
     # ----------------------------------------------------------------- main
+    def _record_paper_error(
+        self, *, component: str, code: str, message: str,
+        severity: str = "ERROR", recovery_action: Optional[str] = None,
+        recovered: bool = False, context: Optional[dict] = None,
+    ) -> None:
+        """Write recovery/runtime failures to both the audit table and journal."""
+        try:
+            ts = epoch(self.now())
+            day = from_epoch(ts).date().isoformat()
+            event = {
+                "timestamp": ts,
+                "trading_date": day,
+                "session_id": self.paper_session_id,
+                "component": component,
+                "severity": severity,
+                "code": code,
+                "message": str(message)[:2000],
+                "recovery_action": recovery_action,
+                "recovered": recovered,
+                "context": context or {},
+            }
+            self.db.record_paper_error(event)
+            self.journal.write(
+                "PAPER_ERROR", ts=ts,
+                detail={key: value for key, value in event.items()
+                        if key not in {"timestamp", "trading_date", "session_id"}},
+            )
+        except Exception:
+            log.exception("could not persist paper error %s", code)
+
+    def _begin_paper_session(self) -> None:
+        previous = self.db.kv_get("paper_runtime_state", {}) or {}
+        interrupted = isinstance(previous, dict) and previous.get("status") in {"STARTING", "RUNNING"}
+        recovered = []
+        try:
+            recovered = self.broker.recover_incomplete_records()
+        except Exception as exc:
+            self._record_paper_error(
+                component="recovery", code="AUDIT_RECOVERY_FAILED",
+                message=f"{exc.__class__.__name__}: {exc}",
+                recovery_action="startup will continue; inspect persistent positions and audit rows",
+                context={"previous_session": previous},
+            )
+        if interrupted or recovered:
+            self._record_paper_error(
+                component="recovery",
+                code="UNEXPECTED_RESTART" if interrupted else "AUDIT_ROWS_RECONSTRUCTED",
+                message=("Previous paper session did not record a clean stop" if interrupted
+                         else "Recovered audit rows from persisted paper positions"),
+                severity="WARNING",
+                recovery_action="open positions and audit history restored from SQLite; quote fields remain missing when unavailable",
+                recovered=True,
+                context={"previous_session": previous, "repaired_position_ids": recovered},
+            )
+        now = self.now()
+        self._paper_current_day = now.date().isoformat()
+        self.db.kv_set("paper_runtime_state", {
+            "status": "RUNNING",
+            "session_id": self.paper_session_id,
+            "started_at": epoch(now),
+            "trading_date": self._paper_current_day,
+            "source": self.source,
+            "mode": "PAPER",
+            "live_orders_sent": False,
+        })
+
+    def _paper_heartbeat(self) -> None:
+        if time.time() - self._last_paper_heartbeat < 30:
+            return
+        now = self.now()
+        self.db.kv_set("paper_runtime_state", {
+            "status": "RUNNING",
+            "session_id": self.paper_session_id,
+            "started_at": self.started_at,
+            "heartbeat_at": epoch(now),
+            "trading_date": now.date().isoformat(),
+            "source": self.source,
+            "mode": "PAPER",
+            "live_orders_sent": False,
+        })
+        self._last_paper_heartbeat = time.time()
+
+    def _refresh_paper_report(self, trading_date: Optional[str] = None) -> Optional[dict]:
+        try:
+            day = trading_date or self.now().date().isoformat()
+            report = self.paper_report_writer.write_day(day)
+            self._last_paper_report_at = time.time()
+            return report
+        except Exception as exc:
+            log.exception("paper report generation failed")
+            self._record_paper_error(
+                component="report", code="REPORT_GENERATION_FAILED",
+                message=f"{exc.__class__.__name__}: {exc}",
+                recovery_action="retry automatically on the next report interval or run python -m paper_trading report",
+                context={"trading_date": trading_date},
+            )
+            return None
+
+    def _finish_paper_session(self) -> None:
+        try:
+            if self._paper_current_day:
+                self._refresh_paper_report(self._paper_current_day)
+            self.db.kv_set("paper_runtime_state", {
+                "status": "STOPPED",
+                "session_id": self.paper_session_id,
+                "stopped_at": epoch(self.now()),
+                "trading_date": self.now().date().isoformat(),
+                "source": self.source,
+                "mode": "PAPER",
+                "live_orders_sent": False,
+            })
+            self.journal.write("APP_STOP", ts=epoch(self.now()),
+                               detail={"mode": "PAPER", "live_orders_sent": False})
+        except Exception:
+            log.exception("paper shutdown persistence failed")
+        log.info("Paper trading engine stopped; no live orders were sent")
+
     def run(self, stop_after: Optional[float] = None) -> None:
-        self.bootstrap()
-        if self.mode == "LIVE" and self.source == "dhan":
-            self.broker.reconcile_positions()
-        self.journal.write("APP_START", ts=int(time.time()),
-                           detail={"mode": self.mode, "source": self.source,
-                                   "open_positions": len(self.positions.get_open()),
-                                   "monitored_contracts": len(self.universe.monitored_ids())})
-        log.info("=== TRADING ENGINE RUNNING (mode=%s) ===", self.mode)
-
+        self._begin_paper_session()
         started_real = time.monotonic()
-        while not self._stop.is_set():
-            t0 = time.monotonic()
-            try:
-                self._tick()
-            except Exception as e:
-                self.last_error = f"{e.__class__.__name__}: {e}"
-                log.exception("Main loop error: %s", e)
-            self.last_update_ts = int(time.time())
-            if stop_after is not None and (time.monotonic() - started_real) >= stop_after:
-                log.info("stop_after reached; shutting down")
-                break
-            elapsed = time.monotonic() - t0
-            sleep_s = max(0.05, self.loop_tick - elapsed)
-            self._stop.wait(sleep_s)
+        try:
+            self.bootstrap()
+            self._refresh_paper_report()
+            self.journal.write("APP_START", ts=epoch(self.now()),
+                               detail={"mode": "PAPER", "source": self.source,
+                                       "paper_session_id": self.paper_session_id,
+                                       "open_positions": len(self.positions.get_open()),
+                                       "monitored_contracts": len(self.universe.monitored_ids()),
+                                       "live_orders_sent": False})
+            log.info("=== PAPER TRADING ENGINE RUNNING (source=%s) ===", self.source)
 
-        self.journal.write("APP_STOP", ts=int(time.time()))
-        log.info("Trading engine stopped")
+            while not self._stop.is_set():
+                t0 = time.monotonic()
+                try:
+                    self._tick()
+                except Exception as exc:
+                    self.last_error = f"{exc.__class__.__name__}: {exc}"
+                    log.exception("Main loop error: %s", exc)
+                    if time.time() - getattr(self, "_last_paper_loop_error", 0) >= 60:
+                        self._last_paper_loop_error = time.time()
+                        self._record_paper_error(
+                            component="main_loop", code="TICK_FAILED",
+                            message=self.last_error,
+                            recovery_action="loop will retry on the next tick",
+                        )
+                self.last_update_ts = int(time.time())
+                if stop_after is not None and (time.monotonic() - started_real) >= stop_after:
+                    log.info("stop_after reached; shutting down")
+                    break
+                elapsed = time.monotonic() - t0
+                sleep_s = max(0.05, self.loop_tick - elapsed)
+                self._stop.wait(sleep_s)
+        except Exception as exc:
+            self._record_paper_error(
+                component="startup", code="PAPER_STARTUP_FAILED",
+                message=f"{exc.__class__.__name__}: {exc}",
+                recovery_action="resolve startup/data error and restart; existing paper positions remain persisted",
+            )
+            raise
+        finally:
+            self._finish_paper_session()
 
     def stop(self) -> None:
         self._stop.set()
@@ -741,19 +972,34 @@ class TraderApp:
     def _tick(self) -> None:
         now = self.now()
         state = session_state(now)
+        trading_day = now.date().isoformat()
+        previous_day = getattr(self, "_paper_current_day", None)
+        if previous_day and previous_day != trading_day:
+            self._refresh_paper_report(previous_day)
+        self._paper_current_day = trading_day
 
         if state == "OPEN":
-            # Intraday Exits at 15:15 PM
-            if now.time() >= dtime(15, 15) and not getattr(self, '_intraday_exited', False):
-                log.info("Intraday time reached (15:15). Closing all positions.")
-                self.journal.write("INTRADAY_EXIT", ts=int(time.time()), detail={"note": "15:15 achieved"})
-                self.exit_all_positions(reason="INTRADAY_EXIT_15_15")
+            # Preserve the existing 15:15 mechanical exit. Failed paper exits
+            # remain open and are retried while the market is open; they are
+            # never silently marked closed without a usable observed price.
+            if now.time() >= dtime(15, 15):
                 self.set_disable_entries(True)
-                self._intraday_exited = True
-            elif now.time() < dtime(15, 15):
-                if getattr(self, '_intraday_exited', False):
-                    self.set_disable_entries(False)
-                    self._intraday_exited = False
+                retry_seconds = max(1.0, float(cfg_get(self.cfg, "paper.exit_retry_seconds", 30)))
+                last_attempt = getattr(self, "_last_intraday_exit_attempt", 0.0)
+                if (not getattr(self, "_intraday_exited", False)
+                        and time.time() - last_attempt >= retry_seconds):
+                    log.info("Intraday time reached (15:15). Closing paper positions.")
+                    self.journal.write(
+                        "INTRADAY_EXIT", ts=epoch(now),
+                        detail={"note": "15:15 achieved", "mode": "PAPER"},
+                    )
+                    self.exit_all_positions(reason="INTRADAY_EXIT_15_15")
+                    self._last_intraday_exit_attempt = time.time()
+                    self._intraday_exited = not bool(self.positions.get_open())
+            elif getattr(self, "_intraday_exited", False):
+                self.set_disable_entries(False)
+                self._intraday_exited = False
+                self._last_intraday_exit_attempt = 0.0
 
             self._process_closed_windows(now)
             if self.source == "mock":
@@ -761,16 +1007,15 @@ class TraderApp:
 
         self._maybe_refresh_universe(now)
         self._poll_ltp(now)
-        self._process_pending_fills(now)
 
-        if self.mode == "LIVE" and self.source == "dhan":
-            poll_every = float(cfg_get(self.cfg, "live.order_poll_seconds", 3))
-            if time.time() - self._last_order_poll >= poll_every:
-                self._last_order_poll = time.time()
-                self.broker.poll_fills()
-
-        # keep the position universe in sync (cheap, every few ticks)
+        # Keep the position universe in sync (cheap, every few ticks), keep a
+        # restart heartbeat, and refresh the durable daily report periodically.
         self._sync_position_universe()
+        self._paper_heartbeat()
+        if time.time() - self._last_paper_report_at >= float(
+            cfg_get(self.cfg, "paper.report_refresh_seconds", 300)
+        ):
+            self._refresh_paper_report(trading_day)
 
     def _ensure_processed(self, sec: str) -> int:
         """Lazily seed the processed-window marker from persisted AVWAP state
@@ -797,6 +1042,11 @@ class TraderApp:
         monitored = sorted(self.universe.monitored_ids())
         first_ts = epoch(last_closed.replace(hour=9, minute=15, second=0, microsecond=0))
         for sec in monitored:
+            # A background re-rank can tighten the new-entry allow-list while
+            # this loop is fetching candles. Recheck membership before work;
+            # position IDs remain present in the monitored union.
+            if sec not in self.universe.monitored_ids():
+                continue
             processed = self._ensure_processed(sec)
             if last_ts <= processed:
                 continue
@@ -808,6 +1058,8 @@ class TraderApp:
                 w -= self.interval * 60
             windows.reverse()
             for win_ts in windows:
+                if sec not in self.universe.monitored_ids():
+                    break
                 # safety: never re-evaluate a candle the AVWAP state already
                 # consumed (restart / contract joined the universe mid-day)
                 st = self.db.get_avwap_state(sec)
@@ -830,13 +1082,24 @@ class TraderApp:
                 c = self.candles.ingest_closed(candle)
                 if c is None:
                     continue
-                self.engine.on_candle(c)
+                signal = self.engine.on_candle(c)
+                try:
+                    self._record_evaluation(c, signal)
+                except Exception:
+                    # Evaluation auditing must not suppress an AVWAP signal or
+                    # stop completed-candle processing if storage is degraded.
+                    log.exception("AVWAP evaluation record failed for %s ts=%s", sec, c.ts)
                 self._persist_candle(sec, c)
                 self._touch_feed("candles", True)
                 self._processed[sec] = win_ts
 
     def _maybe_refresh_universe(self, now: datetime) -> None:
         refresh_min = float(cfg_get(self.cfg, "market_data.universe_refresh_minutes", 60))
+        if self.opportunity_enabled:
+            scanner_min = float(cfg_get(self.cfg, "opportunity.refresh_minutes", 15))
+            if scanner_min <= 0:
+                scanner_min = 15.0
+            refresh_min = min(refresh_min, scanner_min)
         if time.time() - self._last_universe_refresh < refresh_min * 60:
             return
         self._last_universe_refresh = time.time()
@@ -845,8 +1108,8 @@ class TraderApp:
                 self.universe.refresh_atm(u, self.feed.spot_for(u))
             return
         if self.source == "dhan":
-            # refresh in the background so the loop never blocks on the
-            # 1-request-per-3s chain rate limit
+            # Chain refresh and re-ranking run in the background so the loop
+            # never blocks on Dhan's one-request-per-three-seconds chain limit.
             threading.Thread(target=self._refresh_universe_dhan, daemon=True,
                              name="universe-refresh").start()
 
@@ -859,7 +1122,26 @@ class TraderApp:
                 master_index.setdefault((c.underlying, c.expiry), {})[
                     (c.strike, c.option_type)
                 ] = c
-            for u in list(self.universe.by_underlying.keys()):
+
+            refresh_underlyings = (
+                list(self._opportunity_symbols)
+                if self.opportunity_enabled
+                else list(self.universe.by_underlying.keys())
+            )
+            if self._opportunity_service is not None and self._opportunity_symbols:
+                # Keep stock-volatility history point-in-time and request it
+                # before the paced chain sweep so the quote/book snapshots are
+                # as fresh as possible when the common scan timestamp is taken.
+                self._scanner_history_by_symbol = self._opportunity_service.fetch_underlying_bars(
+                    symbols=self._opportunity_symbols,
+                    as_of=self.now(),
+                )
+            if self.opportunity_enabled:
+                with self._chain_snapshot_lock:
+                    for u in refresh_underlyings:
+                        self._chain_snapshots.pop(u.upper(), None)
+
+            for u in refresh_underlyings:
                 try:
                     self._bootstrap_underlying_dhan(u, today, switch_day, master_index)
                 except Exception as e:
@@ -868,10 +1150,342 @@ class TraderApp:
                 uinfo = self.universe.get(u)
                 if uinfo and uinfo.spot:
                     self.universe.refresh_atm(u, uinfo.spot)
+            if self.opportunity_enabled:
+                self._run_opportunity_scan()
             log.info("Universe refresh complete: %d underlyings",
                      len(self.universe.by_underlying))
-        except Exception:
+        except Exception as exc:
             log.exception("Universe refresh crashed")
+            if self.opportunity_enabled:
+                self._fail_closed_opportunity_scan(exc)
+                self._record_paper_scan_failure(exc, 0.0)
+
+    def _run_opportunity_scan(self):
+        """Rank current new-entry candidates and atomically update the allow-list."""
+        if not self.opportunity_enabled:
+            return None
+        started = time.perf_counter()
+        if self._opportunity_service is None:
+            error = RuntimeError("opportunity scanner inputs were not initialized")
+            self._fail_closed_opportunity_scan(error)
+            self._record_paper_scan_failure(error, 0.0)
+            return None
+
+        with self._chain_snapshot_lock:
+            chain_snapshots = dict(self._chain_snapshots)
+        with self._opportunity_lock:
+            underlying_bars = dict(self._scanner_history_by_symbol)
+        positions = self.positions.get_open()
+        try:
+            result = self._opportunity_service.scan(
+                chain_snapshots=chain_snapshots,
+                underlying_bars_by_symbol=underlying_bars,
+                existing_position_underlyings=tuple(
+                    str(position.get("underlying") or "").strip().upper()
+                    for position in positions
+                    if str(position.get("underlying") or "").strip()
+                ),
+                existing_position_security_ids=tuple(
+                    str(position.get("security_id") or "") for position in positions
+                ),
+            )
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            log.exception("Opportunity scan failed; clearing new-entry eligibility")
+            self._fail_closed_opportunity_scan(exc)
+            self._record_paper_scan_failure(exc, elapsed_ms)
+            return None
+
+        self._apply_opportunity_result(result)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        try:
+            self._record_paper_scan(result, elapsed_ms)
+        except Exception as exc:
+            log.exception("Scanner snapshot persistence failed; fail-closing new entries")
+            self._fail_closed_opportunity_scan(exc)
+            self._record_paper_error(
+                component="scanner_persistence", code="SCAN_PERSISTENCE_FAILED",
+                message=f"{exc.__class__.__name__}: {exc}",
+                recovery_action="new-entry eligibility cleared; retry at next scanner refresh",
+            )
+            return None
+        self._refresh_paper_report(result.timestamp.date().isoformat())
+        return result
+
+    def _record_paper_scan_failure(self, error: Exception, duration_ms: float) -> None:
+        now = self.now()
+        scan_id = f"{epoch(now)}-{uuid.uuid4().hex[:10]}"
+        try:
+            self.db.record_paper_scan({
+                "scan_id": scan_id,
+                "timestamp": epoch(now),
+                "trading_date": now.date().isoformat(),
+                "status": "failed",
+                "stocks_scanned": len(self._opportunity_symbols),
+                "contracts_scanned": 0,
+                "qualified_contracts": 0,
+                "rejected_contracts": 0,
+                "selected_contracts": 0,
+                "duration_ms": max(0.0, float(duration_ms)),
+                "symbols": list(self._opportunity_symbols),
+                "error": f"{error.__class__.__name__}: {error}",
+            }, [])
+            self._record_paper_error(
+                component="scanner", code="OPPORTUNITY_SCAN_FAILED",
+                message=f"{error.__class__.__name__}: {error}",
+                recovery_action="new-entry eligibility remains cleared; retry at next scanner refresh",
+                context={"scan_id": scan_id, "duration_ms": duration_ms},
+            )
+            self._refresh_paper_report(now.date().isoformat())
+        except Exception:
+            log.exception("failed to persist scanner failure snapshot")
+
+    def _record_paper_scan(self, result, duration_ms: float) -> None:
+        """Persist each discovered contract, including qualification/rejection state."""
+        service = self._opportunity_service
+        discovered = dict(getattr(service, "last_discovered_contracts", {}) or {})
+        liquidity_report = getattr(service, "last_liquidity_report", None)
+        liquidity_by_id = liquidity_report.by_security_id() if liquidity_report else {}
+        volatility_by_symbol = getattr(service, "last_volatility_by_underlying", {}) or {}
+        ranked = {str(row.security_id): row for row in (result.contracts or ())}
+        top = {str(row.security_id): row for row in (result.top_opportunities or ())}
+        excluded = {str(row.security_id): row for row in (result.excluded_contracts or ())}
+        selected_ids = set(self.universe.scanner_ids())
+        timestamp = epoch(result.timestamp)
+        scan_id = f"{timestamp}-{uuid.uuid4().hex[:10]}"
+        candidates = []
+        qualified_count = 0
+        for security_id, contract in sorted(discovered.items()):
+            liquidity = liquidity_by_id.get(str(security_id))
+            is_qualified = bool(liquidity and liquidity.qualified)
+            qualified_count += int(is_qualified)
+            rank_item = ranked.get(str(security_id)) or top.get(str(security_id))
+            exclusion = excluded.get(str(security_id))
+            volatility = volatility_by_symbol.get(str(contract.underlying).upper())
+            reasons = list(getattr(liquidity, "rejection_reasons", ()) or ()) if liquidity else []
+            if exclusion is not None:
+                reasons = list(dict.fromkeys(reasons + list(exclusion.reasons or ())))
+                status = "EXCLUDED_" + "_".join(str(v) for v in exclusion.reasons)
+            elif not liquidity:
+                reasons = ["MISSING_LIQUIDITY_RESULT"]
+                status = "MISSING_LIQUIDITY_RESULT"
+            elif not is_qualified:
+                status = "REJECTED_LIQUIDITY"
+            elif str(security_id) in top and str(security_id) in selected_ids:
+                status = "TOP_OPPORTUNITY"
+            elif str(security_id) in top:
+                reasons = ["AVWAP_HISTORY_PRIME_FAILED_OR_NOT_REGISTERED"]
+                status = "AVWAP_HISTORY_PRIME_FAILED"
+            elif rank_item is not None:
+                status = "RANKED_NOT_TOP"
+            elif volatility is None:
+                reasons = ["MISSING_VOLATILITY_RESULT"]
+                status = "MISSING_VOLATILITY_RESULT"
+            else:
+                status = "NOT_SELECTED_BY_STOCK_LIMIT"
+            candidates.append({
+                "security_id": str(security_id),
+                "symbol": str(contract.underlying).upper(),
+                "contract_name": contract.name,
+                "expiry": str(contract.expiry),
+                "strike": float(contract.strike),
+                "option_type": str(contract.option_type),
+                "status": status,
+                "qualified": is_qualified,
+                "selected_for_avwap": str(security_id) in selected_ids,
+                "rank": getattr(rank_item, "rank", None),
+                "liquidity_score": getattr(rank_item, "liquidity_score", None)
+                    if rank_item is not None else getattr(liquidity, "score", None),
+                "volatility_score": getattr(rank_item, "volatility_score", None)
+                    if rank_item is not None else getattr(volatility, "volatility_score", None),
+                "opportunity_score": getattr(rank_item, "opportunity_score", None),
+                "spread_percent": getattr(liquidity, "spread_percent", None),
+                "quote_age_seconds": getattr(liquidity, "quote_age_seconds", None),
+                "rejection_reasons": reasons,
+            })
+        now_date = result.timestamp.date().isoformat()
+        selected_count = len(selected_ids)
+        self.db.record_paper_scan({
+            "scan_id": scan_id,
+            "timestamp": timestamp,
+            "trading_date": now_date,
+            "status": "completed",
+            "stocks_scanned": len(self._opportunity_symbols),
+            "contracts_scanned": len(discovered),
+            "qualified_contracts": qualified_count,
+            "rejected_contracts": max(0, len(discovered) - qualified_count),
+            "selected_contracts": selected_count,
+            "duration_ms": max(0.0, float(duration_ms)),
+            "symbols": list(self._opportunity_symbols),
+            "error": None,
+        }, candidates)
+
+    def _apply_opportunity_result(self, result) -> None:
+        """Apply top-ranked eligibility only; AVWAP remains the signal authority."""
+        # The background scan can overlap an entry on the main thread. Re-read
+        # open positions at apply time so a newly opened underlying cannot sneak
+        # into the new-entry allow-list from a ranking started just before it.
+        positions = self.positions.get_open()
+        position_ids = {
+            str(position.get("security_id") or "") for position in positions
+            if position.get("security_id")
+        }
+        position_underlyings = set()
+        for position in positions:
+            underlying = str(position.get("underlying") or "").strip()
+            if not underlying:
+                contract = self.engine.contract_for(str(position.get("security_id") or ""))
+                underlying = contract.underlying if contract is not None else ""
+            if underlying:
+                position_underlyings.add(underlying.strip().upper())
+        # Phase 2 result objects carry the authoritative contract metadata used
+        # by SignalEngine and order sizing; ranking rows themselves never create
+        # a Signal or order.
+        discovered = getattr(self._opportunity_service, "last_discovered_contracts", {})
+        self.engine.register_contracts(list(discovered.values()))
+
+        ranked = tuple(getattr(result, "top_opportunities", ()) or ())
+        eligible_ids = {
+            str(item.security_id) for item in ranked
+            if item.security_id
+            and str(item.symbol).strip().upper() not in position_underlyings
+        }
+        candidate_scores = {
+            str(item.security_id): {
+                "symbol": item.symbol,
+                "option": item.contract_name,
+                "liquidity_score": item.liquidity_score,
+                "volatility_score": item.volatility_score,
+                "opportunity_score": item.opportunity_score,
+                "timestamp": result.timestamp,
+            }
+            for item in ranked
+        }
+        if self._bootstrap_complete:
+            # Remove contracts that fell out of the new ranking immediately;
+            # newly selected contracts are added only after their AVWAP history
+            # has been primed below. Update scores for retained IDs atomically.
+            retained = self.universe.scanner_ids() & eligible_ids
+            with self._opportunity_lock:
+                previous = self._opportunity_scores
+                preserved = {security_id: previous[security_id]
+                             for security_id in position_ids if security_id in previous}
+                self._opportunity_scores = {
+                    **preserved,
+                    **{security_id: candidate_scores[security_id]
+                       for security_id in retained if security_id in candidate_scores},
+                }
+            self.universe.set_eligible_scanner_ids(retained)
+            eligible_ids = self._prime_opportunity_contracts(eligible_ids)
+
+        known_ids = {
+            security_id for security_id in eligible_ids
+            if self.engine.contract_for(security_id) is not None
+        }
+        missing_contracts = eligible_ids - known_ids
+        if missing_contracts:
+            log.warning("Opportunity scan omitted %d contract(s) without registered metadata",
+                        len(missing_contracts))
+        eligible_ids = known_ids
+        scores = {
+            security_id: candidate_scores[security_id]
+            for security_id in eligible_ids if security_id in candidate_scores
+        }
+        with self._opportunity_lock:
+            # Keep the last selected scanner metrics for active positions, whose
+            # underlyings are intentionally excluded from new-opportunity ranks.
+            previous = self._opportunity_scores
+            preserved = {security_id: previous[security_id]
+                         for security_id in position_ids if security_id in previous}
+            self._opportunity_scores = {**preserved, **scores}
+            self.opportunity_result = result
+            self.opportunity_error = None
+            self.opportunity_status = "ready" if eligible_ids else "no_eligible_contracts"
+
+        # This assignment is deliberately last for newly selected contracts:
+        # their required AVWAP history was primed before they can be evaluated.
+        self.universe.set_eligible_scanner_ids(eligible_ids)
+        log.info(
+            "Opportunity scan %s: %d eligible top opportunities (%d qualified ranked contracts)",
+            result.timestamp.isoformat(), len(eligible_ids), len(result.contracts),
+        )
+
+    def _fail_closed_opportunity_scan(self, error: Exception) -> None:
+        """On missing scanner inputs, stop new candidates but preserve positions."""
+        self.universe.set_eligible_scanner_ids(set())
+        positions = self.positions.get_open()
+        position_ids = {str(p.get("security_id") or "") for p in positions}
+        with self._opportunity_lock:
+            self._opportunity_scores = {
+                security_id: value for security_id, value in self._opportunity_scores.items()
+                if security_id in position_ids
+            }
+            self.opportunity_status = "error"
+            self.opportunity_error = f"{error.__class__.__name__}: {error}"
+
+    def _prime_opportunity_contracts(self, security_ids: set[str]) -> set[str]:
+        """Backfill newly selected contracts before exposing them to candle evaluation.
+
+        A contract can leave and later re-enter the opportunity list. Its
+        AVWAP state is merged from the last consumed candle, so skipped scanner
+        intervals do not reset or re-anchor the existing AVWAP calculation.
+        """
+        current_ids = self.universe.scanner_ids()
+        position_ids = {str(p["security_id"]) for p in self.positions.get_open()}
+        new_ids = sorted(security_ids - current_ids - position_ids)
+        if not new_ids:
+            return set(security_ids)
+
+        now = self.now()
+        history_gap = float(cfg_get(self.cfg, "market_data.history_request_gap_seconds", 1.0))
+        partial = set(self.db.kv_get("avwap_partial_history", []) or [])
+        accepted = set(security_ids)
+        latest_ended = self._last_ended_session_candle_ts(now)
+        current_start = candle_start_for(now, self.interval)
+        for index, security_id in enumerate(new_ids):
+            contract = self.engine.contract_for(security_id)
+            if contract is None:
+                accepted.discard(security_id)
+                continue
+            if index and history_gap > 0:
+                time.sleep(history_gap)
+            state = self.db.get_avwap_state(security_id)
+            last_ts = int(state["last_candle_ts"] or 0) if state else 0
+            # Existing state needs the full gap since its last consumed bar;
+            # only a brand-new contract uses the normal bounded anchor window.
+            from_dt = from_epoch(last_ts) if last_ts else self._history_from_dt(now)
+            try:
+                history, full_range = self.feed.history_for(security_id, from_dt, to_dt=now)
+                if current_start is not None:
+                    history = [candle for candle in history
+                               if candle.ts < epoch(current_start)]
+                if history:
+                    self.avwap.initialize_from_candles(
+                        security_id, history, symbol=contract.name
+                    )
+                    if full_range:
+                        partial.discard(security_id)
+                    else:
+                        partial.add(security_id)
+                refreshed = self.db.get_avwap_state(security_id)
+                refreshed_last = int(refreshed["last_candle_ts"] or 0) if refreshed else 0
+                stale = bool(latest_ended and refreshed_last < latest_ended)
+                if not refreshed_last or stale:
+                    log.warning("Opportunity contract %s not activated: AVWAP history is unavailable/stale",
+                                contract.name)
+                    accepted.discard(security_id)
+                    continue
+                processed = refreshed_last
+                if from_epoch(processed).date() != now.date():
+                    processed = 0
+                self._processed[security_id] = processed
+            except Exception as exc:
+                log.warning("Could not prime AVWAP history for opportunity %s: %s",
+                            contract.name, exc)
+                accepted.discard(security_id)
+
+        self.db.kv_set("avwap_partial_history", sorted(partial))
+        return accepted
 
     # ------------------------------------------------------------------ LTP
     def _poll_ltp(self, now: datetime) -> None:
@@ -895,6 +1509,9 @@ class TraderApp:
             with self._ltp_lock:
                 for sec, q in quotes.items():
                     self.ltp[sec] = q.price
+                    if self.mode == "PAPER":
+                        with self._quote_cache_lock:
+                            self._option_quote_cache[str(sec)] = q
             # An empty/partial quote response used to be SILENT (dashboard
             # LTP column stuck at "–" with nothing in the log). Log it.
             if got == 0:
@@ -928,14 +1545,135 @@ class TraderApp:
                     uq = self.md.quotes_segment(uids, "NSE_EQ")
                     for u, uid in self.underlying_ids.items():
                         q = uq.get(str(uid))
+                        if q:
+                            with self._quote_cache_lock:
+                                self._underlying_quote_cache[str(u).upper()] = q
                         if q and u in self.universe.by_underlying:
                             self.universe.refresh_atm(u, q.price)
                 except Exception as e:
                     log.warning("underlying spot poll failed: %s", e)
+        if self.mode == "PAPER":
+            self._save_paper_position_marks(now)
+
+    def _paper_quote_snapshot(self, security_id: str):
+        """Return the last observed book, even when stale, for truthful audit fields."""
+        with self._quote_cache_lock:
+            return self._option_quote_cache.get(str(security_id))
+
+    def _fresh_quote_for(self, security_id: str, now: Optional[datetime] = None):
+        """Return only a real, timestamped, still-fresh Dhan quote snapshot."""
+        quote = self._paper_quote_snapshot(security_id)
+        if quote is None:
+            return None
+        quote_ts = getattr(quote, "ts", None)
+        try:
+            quote_ts = int(quote_ts)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if quote_ts <= 0:
+            return None
+        at = epoch(now or self.now())
+        age = at - quote_ts
+        max_age = float(cfg_get(self.cfg, "paper.max_quote_age_seconds", 60))
+        if age < 0 or age > max_age:
+            return None
+        return quote
+
+    def _fresh_underlying_spot(self, underlying: str, now: Optional[datetime] = None):
+        with self._quote_cache_lock:
+            quote = self._underlying_quote_cache.get(str(underlying).strip().upper())
+        if quote is None:
+            return None
+        quote_ts = getattr(quote, "ts", None)
+        price = getattr(quote, "price", None)
+        try:
+            quote_ts, price = int(quote_ts), float(price)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        age = epoch(now or self.now()) - quote_ts
+        max_age = float(cfg_get(self.cfg, "paper.max_quote_age_seconds", 60))
+        if quote_ts <= 0 or not math.isfinite(price) or price <= 0 or age < 0 or age > max_age:
+            return None
+        return price
+
+    def _latest_completed_option_close(self, security_id: str, now: datetime):
+        """Return today's last completed Dhan/mock option candle, never a guessed price."""
+        state = self.db.get_avwap_state(str(security_id))
+        if not state or state["last_candle_ts"] is None or state["last_close"] is None:
+            return None
+        candle_ts = int(state["last_candle_ts"])
+        price = float(state["last_close"])
+        now_ts = epoch(now)
+        completed_at = candle_ts + self.interval * 60
+        try:
+            max_age = float(cfg_get(self.cfg, "paper.max_exit_candle_age_seconds", 1800))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        age = now_ts - completed_at
+        if (not math.isfinite(max_age) or max_age < 0 or not math.isfinite(price)
+                or price <= 0 or candle_ts <= 0 or age < 0 or age > max_age
+                or from_epoch(candle_ts).date() != now.date()):
+            return None
+        return price, candle_ts
+
+    def _save_paper_position_marks(self, now: datetime) -> None:
+        """Persist marks only from timestamped marketfeed LTP observations."""
+        try:
+            for position in self.positions.get_open():
+                quote = self._fresh_quote_for(position["security_id"], now)
+                if quote is None:
+                    continue
+                price = float(getattr(quote, "price", 0) or 0)
+                if not math.isfinite(price) or price <= 0:
+                    continue
+                bid = getattr(quote, "bid", None)
+                ask = getattr(quote, "ask", None)
+                try:
+                    bid = float(bid) if bid is not None and float(bid) > 0 else None
+                    ask = float(ask) if ask is not None and float(ask) > 0 else None
+                except (TypeError, ValueError, OverflowError):
+                    bid, ask = None, None
+                spread = None
+                if bid is not None and ask is not None and ask >= bid:
+                    mid = (bid + ask) / 2.0
+                    spread = ((ask - bid) / mid * 100.0) if mid > 0 else None
+                quote_ts = int(getattr(quote, "ts", 0) or 0)
+                entry_price = float(position.get("entry_price") or 0)
+                quantity = int(position.get("quantity") or 0)
+                state = self.db.get_avwap_state(position["security_id"])
+                self.db.save_paper_position_mark({
+                    "position_id": position["position_id"],
+                    "security_id": position["security_id"],
+                    "observed_at": quote_ts,
+                    "last_price": price,
+                    "bid": bid,
+                    "ask": ask,
+                    "spread_percent": spread,
+                    "quote_age_seconds": max(0, epoch(now) - quote_ts),
+                    "avwap": state["last_avwap"] if state else None,
+                    "unrealized_pnl": (entry_price - price) * quantity,
+                    "mark_source": ("DHAN_MARKETFEED_QUOTE_LTP" if self.source == "dhan"
+                                    else "MOCK_SYNTHETIC_LTP"),
+                })
+        except Exception as exc:
+            log.exception("paper position mark persistence failed")
+            self._record_paper_error(
+                component="position_mark", code="MARK_PERSISTENCE_FAILED",
+                message=f"{exc.__class__.__name__}: {exc}",
+                recovery_action="will retry on the next successful quote poll",
+            )
 
     def ltp_getter(self, security_id: str) -> Optional[float]:
-        with self._ltp_lock:
-            return self.ltp.get(security_id)
+        """Return only a fresh, finite quote; cached display values are not risk marks."""
+        quote = self._fresh_quote_for(str(security_id))
+        if quote is None:
+            return None
+        value = getattr(quote, "price", None)
+        try:
+            price = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return price if math.isfinite(price) and price > 0 else None
 
     def _sync_position_universe(self) -> None:
         open_ids = {p["security_id"] for p in self.positions.get_open()}
@@ -949,6 +1687,45 @@ class TraderApp:
                 if p:
                     self._adopt_position_contract(p)
 
+    # -------------------------------------------------------- evaluations
+    def _record_evaluation(self, candle, signal) -> None:
+        """Persist scanner context plus the unchanged AVWAP candle outcome."""
+        contract = self.engine.contract_for(candle.security_id)
+        state = self.db.get_avwap_state(candle.security_id)
+        with self._opportunity_lock:
+            scanner = dict(self._opportunity_scores.get(candle.security_id, {}))
+        scanner_ts = scanner.get("timestamp")
+        if isinstance(scanner_ts, datetime):
+            scanner_ts = epoch(scanner_ts)
+        elif scanner_ts is not None:
+            try:
+                scanner_ts = int(scanner_ts)
+            except (TypeError, ValueError, OverflowError):
+                scanner_ts = None
+
+        symbol = contract.underlying if contract else str(candle.security_id)
+        option = (
+            f"{contract.strike:g} {contract.option_type} {contract.expiry}"
+            if contract else str(candle.security_id)
+        )
+        self.db.save_evaluation({
+            "timestamp": epoch(self.now()),
+            "candle_ts": int(candle.ts),
+            "security_id": str(candle.security_id),
+            "symbol": str(symbol),
+            "option": option,
+            "option_type": contract.option_type if contract else None,
+            "strike": contract.strike if contract else None,
+            "expiry": contract.expiry if contract else None,
+            "liquidity_score": scanner.get("liquidity_score"),
+            "volatility_score": scanner.get("volatility_score"),
+            "opportunity_score": scanner.get("opportunity_score"),
+            "scanner_timestamp": scanner_ts,
+            "avwap": state["last_avwap"] if state else None,
+            "option_close": float(candle.close),
+            "signal": signal.action if signal else None,
+        })
+
     # ------------------------------------------------------------ signals
     def _on_signal(self, sig) -> None:
         log.info("SIGNAL %s %s @ %.2f (avwap %s) reason=%s",
@@ -958,18 +1735,37 @@ class TraderApp:
             self._handle_entry(sig)
         elif sig.action == EXIT_BUY:
             self._handle_exit(sig)
+        self._refresh_paper_report(self.now().date().isoformat())
 
     def _risk_gate(self) -> list[str]:
         open_pos = self.positions.get_open()
         day = self.now().strftime("%Y-%m-%d")
         trades_today = self.db.trades_today_count(day)
-        daily_pnl = self.risk.daily_pnl(day, open_pos, self.ltp_getter)
-        return self.risk.entry_block_reasons(len(open_pos), trades_today, daily_pnl)
+        marks = {
+            str(position["security_id"]): self.ltp_getter(str(position["security_id"]))
+            for position in open_pos
+        }
+        daily_pnl = self.risk.daily_pnl(
+            day, open_pos, lambda security_id: marks.get(str(security_id))
+        )
+        reasons = self.risk.entry_block_reasons(len(open_pos), trades_today, daily_pnl)
+        max_loss = float(cfg_get(self.cfg, "risk.max_daily_loss", 0) or 0)
+        unpriced = sorted(security_id for security_id, mark in marks.items() if mark is None)
+        if max_loss > 0 and unpriced:
+            reasons = [reason for reason in reasons
+                       if reason != "UNPRICED_OPEN_POSITION_DRAWDOWN_GATE"]
+            reasons.append(f"UNPRICED_OPEN_POSITION({','.join(unpriced)})")
+        return reasons
 
     def _handle_entry(self, sig) -> None:
         contract = self.engine.contract_for(sig.security_id)
         if contract is None:
             log.error("Entry signal for unknown contract %s; skipped", sig.security_id)
+            self._record_paper_error(
+                component="execution", code="UNKNOWN_ENTRY_CONTRACT",
+                message=f"No registered contract for security_id={sig.security_id}",
+                recovery_action="signal was not executed; wait for a valid scanner/bootstrap registration",
+            )
             return
         if self.positions.has_open(sig.security_id):
             return  # one short per contract (spec §44)
@@ -983,77 +1779,86 @@ class TraderApp:
                 detail={"reasons": reasons},
             )
             return
-        qty = self.risk.quantity_for(contract)
-        if self.mode == "PAPER":
-            if self.broker.fill_mode == "next_quote":
-                deadline = sig.created_at + int(cfg_get(self.cfg, "paper.next_quote_timeout_seconds", 45))
-                with self._pending_fill_lock:
-                    self._pending_fills.append({
-                        "kind": "entry", "contract": contract,
-                        "quantity": qty, "signal": sig, "deadline": deadline,
-                    })
-                return
-            self.broker.execute_entry(contract, qty, sig)
-        else:
-            self.broker.execute_entry(contract, qty, sig)
+        quantity = self.risk.quantity_for(contract)
+        execution_time = self.now()
+        result = self.broker.execute_entry(
+            contract, quantity, sig,
+            quote=self._paper_quote_snapshot(contract.security_id),
+            execution_time=execution_time,
+            underlying_spot=self._fresh_underlying_spot(contract.underlying, execution_time),
+        )
+        if not result.is_filled:
+            self._record_paper_error(
+                component="execution", code="PAPER_ENTRY_REJECTED",
+                message=f"{contract.name}: {result.raw}",
+                recovery_action="no position opened; inspect quote freshness and signal price before retry",
+                context={"security_id": contract.security_id, "signal_key": sig.signal_key},
+            )
 
     def _handle_exit(self, sig) -> None:
         pos = self.positions.find_by_security(sig.security_id)
         if pos is None:
             log.error("Exit signal with no open position: %s", sig.symbol)
+            self._record_paper_error(
+                component="execution", code="EXIT_WITHOUT_OPEN_POSITION",
+                message=f"Exit signal has no open paper position: {sig.security_id}",
+                severity="WARNING",
+                recovery_action="position state retained; no synthetic close was created",
+            )
             return
-        if self.mode == "PAPER":
-            if self.broker.fill_mode == "next_quote":
-                deadline = sig.created_at + int(cfg_get(self.cfg, "paper.next_quote_timeout_seconds", 45))
-                with self._pending_fill_lock:
-                    self._pending_fills.append({
-                        "kind": "exit", "position": pos,
-                        "signal": sig, "deadline": deadline,
-                    })
-                return
-            self.broker.execute_exit(pos, sig)
-        else:
-            self.broker.execute_exit(pos, sig)
-
-    def _process_pending_fills(self, now: datetime) -> None:
-        now_ts = epoch(now)
-        with self._pending_fill_lock:
-            due = [p for p in self._pending_fills
-                   if self.ltp_getter(p["signal"].security_id) is not None
-                   or now_ts >= p["deadline"]]
-            for p in due:
-                self._pending_fills.remove(p)
-        for p in due:
-            sec = p["signal"].security_id
-            price = self.ltp_getter(sec)
-            fallback = p["signal"].signal_price
-            use = price if price is not None else fallback
-            note = "quote" if price is not None else "fallback_candle_close"
-            log.info("Paper fill (%s) for %s @ %.2f", note, p["signal"].symbol, use or -1)
-            if p["kind"] == "entry":
-                res = self.broker.execute_entry(p["contract"], p["quantity"],
-                                                p["signal"], fill_price=use)
-                if not res.is_filled:
-                    log.error("Paper entry fill failed: %s", res.raw)
-            else:
-                res = self.broker.execute_exit(p["position"], p["signal"],
-                                               fill_price=use)
-                if not res.is_filled:
-                    log.error("Paper exit fill failed: %s", res.raw)
+        execution_time = self.now()
+        result = self.broker.execute_exit(
+            pos, sig,
+            quote=self._paper_quote_snapshot(sig.security_id),
+            execution_time=execution_time,
+            contract=self.engine.contract_for(sig.security_id),
+        )
+        if not result.is_filled:
+            self._record_paper_error(
+                component="execution", code="PAPER_EXIT_REJECTED",
+                message=f"{pos.get('symbol')}: {result.raw}",
+                recovery_action="position remains open; retry on next valid strategy or manual paper-exit action",
+                context={"position_id": pos.get("position_id"), "signal_key": sig.signal_key},
+            )
 
     # ---------------------------------------------------------- emergency
     def exit_all_positions(self, reason: str = "MANUAL_EXIT_ALL") -> int:
-        log.warning("EXIT ALL POSITIONS requested (%s)", reason)
-        self.journal.write("EXIT_ALL_REQUESTED", ts=int(time.time()), detail={"reason": reason})
-        if self.mode == "PAPER":
-            n = 0
-            for pos in self.positions.get_open():
-                price = self.ltp_getter(pos["security_id"]) or pos.get("entry_price")
-                res = self.broker.execute_exit(pos, None, fill_price=price, reason=reason)
-                if res.is_filled:
-                    n += 1
-            return n
-        return self.broker.exit_all(self.ltp_getter, reason)
+        log.warning("PAPER EXIT ALL POSITIONS requested (%s)", reason)
+        now = self.now()
+        self.journal.write("EXIT_ALL_REQUESTED", ts=epoch(now),
+                           detail={"reason": reason, "mode": "PAPER"})
+        closed = 0
+        for position in self.positions.get_open():
+            security_id = position["security_id"]
+            quote = self._paper_quote_snapshot(security_id)
+            fresh = self._fresh_quote_for(security_id, now)
+            if fresh is not None:
+                price_reference = getattr(fresh, "price", None)
+                reference_method = "FRESH_LTP_FALLBACK_NO_VALID_TWO_SIDED_BOOK"
+            else:
+                candle_reference = self._latest_completed_option_close(security_id, now)
+                price_reference = candle_reference[0] if candle_reference is not None else None
+                reference_method = (
+                    "LAST_COMPLETED_OPTION_CANDLE_CLOSE_FALLBACK"
+                    if candle_reference is not None else None
+                )
+            result = self.broker.execute_exit(
+                position, None, fill_price=price_reference,
+                reason=reason, quote=quote, execution_time=now,
+                contract=self.engine.contract_for(security_id),
+                fill_price_method=reference_method,
+            )
+            if result.is_filled:
+                closed += 1
+            else:
+                self._record_paper_error(
+                    component="execution", code="PAPER_EXIT_ALL_POSITION_REJECTED",
+                    message=f"{position.get('symbol')}: {result.raw}",
+                    recovery_action="position remains open; refresh Dhan quote and retry the paper exit",
+                    context={"position_id": position.get("position_id")},
+                )
+        self._refresh_paper_report(now.date().isoformat())
+        return closed
 
     def set_emergency_stop(self, on: bool) -> None:
         self.risk.set_emergency_stop(on)
@@ -1107,27 +1912,55 @@ class TraderApp:
         return "scheduled - applies at next application start"
 
     def close_position_manual(self, position_id: str) -> str:
-        """V2 (Positions page): operational buy-to-close of one position.
-        Uses the normal broker exit path (paper: virtual fill; live: real
-        BUY order through the standard lifecycle) - never a bypass."""
+        """Paper buy-to-close using a current book or explicitly labeled LTP."""
         pos = self.db.get_position(position_id)
         if pos is None:
             return "position not found"
         pos = dict(pos)
         if pos["status"] not in ("OPEN", "PENDING"):
             return f"position is not open (status: {pos['status']})"
-        price = self.ltp_getter(pos["security_id"]) or pos.get("entry_price")
+        now = self.now()
+        quote = self._paper_quote_snapshot(pos["security_id"])
+        fresh = self._fresh_quote_for(pos["security_id"], now)
+        ltp_reference = getattr(fresh, "price", None) if fresh is not None else None
         self.journal.write(
-            "MANUAL_CLOSE_REQUESTED", ts=int(time.time()),
+            "MANUAL_CLOSE_REQUESTED", ts=epoch(now),
             position_id=position_id, security_id=pos["security_id"],
-            symbol=pos["symbol"], detail={"price": price},
+            symbol=pos["symbol"],
+            detail={"ltp_reference": ltp_reference, "fresh_quote_available": fresh is not None},
         )
-        res = self.broker.execute_exit(pos, None, fill_price=price,
-                                       reason="MANUAL_CLOSE")
-        if res.is_filled:
-            return f"closed (fill {res.status})"
-        return f"exit order placed: {res.order_id} ({res.status})" if res.order_id \
-            else f"exit failed: {res.raw}"
+        result = self.broker.execute_exit(
+            pos, None, fill_price=ltp_reference,
+            reason="MANUAL_CLOSE", quote=quote, execution_time=now,
+            contract=self.engine.contract_for(pos["security_id"]),
+        )
+        if result.is_filled:
+            self._refresh_paper_report(now.date().isoformat())
+            method = (result.raw or {}).get("execution_method", "paper fill")
+            return f"closed as paper fill at {result.avg_price:.4f} ({method})"
+        self._record_paper_error(
+            component="execution", code="MANUAL_PAPER_CLOSE_REJECTED",
+            message=str(result.raw),
+            recovery_action="position was not closed; obtain a fresh Dhan quote and retry",
+            context={"position_id": position_id},
+        )
+        return f"paper exit not filled: {result.raw}"
+
+    def paper_report_payload(self, trading_date: Optional[str] = None) -> dict:
+        """Read a persisted day summary for the dashboard/API, without regenerating it."""
+        day = trading_date or self.now().date().isoformat()
+        date.fromisoformat(day)  # validate the requested date
+        saved = next((row for row in self.db.get_paper_daily_reports(limit=10000)
+                      if row.get("trading_date") == day), None)
+        return {
+            "status": "ready" if saved else "not_generated",
+            "trading_date": day,
+            "summary": (saved or {}).get("summary", {}),
+            "report_dir": (saved or {}).get("report_dir", str(self.paper_report_dir)),
+            "generated_at": (saved or {}).get("generated_at"),
+            "paper_trading_only": True,
+            "live_orders_sent": False,
+        }
 
     def _next_candle_close_ts(self, now: datetime) -> int:
         """When the CURRENT (in-progress) 15-min candle will close."""
@@ -1167,6 +2000,14 @@ class TraderApp:
             return {
                 "mode": self.mode,
                 "source": self.source,
+                "paper": {
+                    "status": "BOOTSTRAPPING",
+                    "scanner_status": self.opportunity_status,
+                    "scanner_error": self.opportunity_error,
+                    "report_dir": str(self.paper_report_dir),
+                    "session_id": self.paper_session_id,
+                    "live_orders_sent": False,
+                },
                 "market_state": state,
                 "clock": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
                 "dhan": ("connected" if self.source == "dhan" else "mock (no live data)"),
@@ -1225,6 +2066,19 @@ class TraderApp:
         open_by_sec = {p["security_id"]: p for p in open_pos}
         flags = self.risk.flags()
         day = now.strftime("%Y-%m-%d")
+        daily_report_rows = self.db.get_paper_daily_reports(limit=1)
+        today_scans = self.db.get_paper_scanner_runs(day)
+        runtime_state = self.db.kv_get("paper_runtime_state", {}) or {}
+        paper_state = {
+            "status": runtime_state.get("status", "READY"),
+            "session_id": runtime_state.get("session_id", self.paper_session_id),
+            "scanner_status": self.opportunity_status,
+            "scanner_error": self.opportunity_error,
+            "last_scan": today_scans[-1] if today_scans else None,
+            "latest_daily_report": daily_report_rows[0] if daily_report_rows else None,
+            "report_dir": str(self.paper_report_dir),
+            "live_orders_sent": False,
+        }
 
         # Full payload (engine is running, universe + AVWAP history are ready).
         scanner_rows = []
@@ -1377,9 +2231,14 @@ class TraderApp:
         losses_today = sum(1 for p in closed_today if (p.get("pnl") or 0) < 0)
         exposure = sum((p.get("entry_price") or 0) * (p.get("quantity") or 0)
                        for p in open_pos)
+        unrealized_complete = all(row.get("unrealized_pnl") is not None for row in pos_rows)
+        unrealized = (
+            sum(row["unrealized_pnl"] for row in pos_rows)
+            if unrealized_complete else None
+        )
         summary = {
             "pnl_today": daily_pnl,
-            "unrealized": sum((r.get("unrealized_pnl") or 0) for r in pos_rows),
+            "unrealized": unrealized,
             "realized_today": self.db.realized_pnl_today(day),
             "realized_total": sum((p.get("pnl") or 0) for p in closed),
             "wins_today": wins_today,
@@ -1460,13 +2319,13 @@ class TraderApp:
                      ("quantity_per_trade", "max_open_positions",
                       "max_trades_per_day", "max_daily_loss")},
             "paper": self.cfg.get("paper", {}),
-            "live": self.cfg.get("live", {}),
             "storage": {"db_path": self.db.path},
         }
 
         return {
             "mode": self.mode,
             "source": self.source,
+            "paper": paper_state,
             "market_state": state,
             "clock": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
             "dhan": ("connected" if self.source == "dhan" else "mock (no live data)"),
